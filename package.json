@@ -1,0 +1,16 @@
+{
+  "name": "bookshelf-detector",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Browser-side book spine detector (contract, geometry, pre/post-processing) for the neighborhood library app.",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.1"
+  }
+}
