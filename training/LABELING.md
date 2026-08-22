@@ -35,6 +35,20 @@ The exact suffix format doesn't matter (`scene01 (2).jpg` from Explorer's
 auto-numbering is fine) — what matters is that every photo of the *same*
 shelf starts with the same `sceneNN`.
 
+**"Same shelf" means "same shelf location," but that's not quite the right
+test if you rearranged books between shots.** What actually matters is how
+*similar the photo's content* is — a model can only leak information from
+a shot it could partially recognize:
+
+- Shelf reshot with a **few** books added/removed/rearranged, still mostly
+  the same spines → **same** scene number.
+- Shelf reshot with **most** books swapped out, so it looks substantially
+  different → fine to use a **new** scene number, even at the same location.
+- **Not sure which side it's on? Use the same number.** Grouping too much
+  costs nothing (just slightly fewer independent scenes). Grouping too
+  little is the actual bug — that's exactly how a near-duplicate shot ends
+  up in both train and validation.
+
 ## What to shoot — in this order (plan §3)
 
 Prioritize failure modes over "normal shelf" shots. ~25 images per row:
