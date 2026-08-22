@@ -13,17 +13,27 @@ Create a new project, import the images, then go to
 
 ## Before you upload: name files by scene
 
-**Rename photos before importing, using `scene<NN>_<variant>.jpg`** — e.g.
-`scene01_a.jpg`, `scene01_b.jpg`, `scene02_a.jpg`. Everything before the
-last `_` is the scene id.
-
 This is not cosmetic. It's the exact same fix that was needed for the
 public data (`training/merge_datasets.py`): if two photos of the *same*
 physical shelf end up in different splits, validation numbers stop
 meaning anything, because the model can partly recognize the shelf it
 already saw in training. One scene = the same physical shelf setup, even
-across multiple shots (different angle, retake, etc.) — give them all the
-same `scene<NN>` prefix.
+across multiple shots (different angle, retake, etc.) — every photo of
+that shelf needs to share the same `sceneNN` prefix.
+
+**Easiest way — Windows Explorer's bulk-rename, not manual typing per file:**
+
+1. Put all your photos in one folder (copy them together first if they
+   came from different phones).
+2. Select all the photos of one shelf (Ctrl+click each one).
+3. Press `F2`, type `scene01`, press Enter. Explorer renames them to
+   `scene01.jpg`, `scene01 (2).jpg`, `scene01 (3).jpg`, ... automatically.
+4. Select the next shelf's photos, repeat with `scene02`, then `scene03`,
+   and so on.
+
+The exact suffix format doesn't matter (`scene01 (2).jpg` from Explorer's
+auto-numbering is fine) — what matters is that every photo of the *same*
+shelf starts with the same `sceneNN`.
 
 ## What to shoot — in this order (plan §3)
 
