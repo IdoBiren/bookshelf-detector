@@ -1,2 +1,13 @@
 node_modules/
 dist/
+__pycache__/
+*.pyc
+
+# Raw third-party datasets: large, and redistribution terms vary by
+# dataset (see THIRD-PARTY-DATA.md) — don't commit the actual files.
+data/raw/*/*
+!data/raw/*/.gitkeep
+
+# Merged/derived dataset: regenerable from data/raw/ via merge_datasets.py,
+# 94MB of copied images — don't commit build output.
+data/merged/
