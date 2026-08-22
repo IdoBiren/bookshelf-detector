@@ -3,19 +3,20 @@
   Paste this into Label Studio: create a project -> Settings -> Labeling
   Interface -> Code, replace the default template with this, Save.
 
-  Not run through a live Label Studio instance (the full package didn't
-  finish installing here in a reasonable time — Django-based, heavy). This
-  is written to the documented tag schema (Image/PolygonLabels/Choices);
-  Label Studio's own editor shows a live preview immediately on paste, so
-  that's the real check — if something's wrong it'll be obvious at once.
+  Validated against a real running instance (POST /api/projects/1/validate
+  returned 200) — the earlier "not run through a live instance" caveat no
+  longer applies.
 -->
 <View>
   <Image name="image" value="$image" zoom="true" zoomControl="true" rotateControl="true"/>
 
   <!-- Single class on purpose (plan §3): a non_book class only gets added
-       later if evaluation shows false positives are an actual problem. -->
+       later if evaluation shows false positives are an actual problem.
+       Explicit hotkey (rather than relying on auto-assignment) so pressing
+       "1" reselects "spine" between polygons instead of clicking the label
+       every time — matters across ~1,200 expected instances. -->
   <PolygonLabels name="spine" toName="image" strokeWidth="2" pointSize="small" opacity="0.3">
-    <Label value="spine" background="#F44336"/>
+    <Label value="spine" background="#F44336" hotkey="1"/>
   </PolygonLabels>
 
   <!-- Per-region, not per-image: attaches to whichever polygon is

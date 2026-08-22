@@ -64,6 +64,13 @@ Prioritize failure modes over "normal shelf" shots. ~25 images per row:
 
 Use multiple phones, not just one. Include some shelves that aren't yours.
 
+## Speed tip: use the keyboard, not the mouse, to select the label
+
+Press **`1`** to select the "spine" label instead of clicking it — it's
+bound as a hotkey in the config. Across ~1,200 expected spine instances
+(200 images x ~6 spines), pressing one key between polygons instead of
+reaching for the label pill every time adds up.
+
 ## Labeling rules (already decided, plan §3 — don't re-derive per image)
 
 - **Trace the polygon exactly to the spine's edges** — not generous, not
