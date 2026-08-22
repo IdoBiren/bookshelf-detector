@@ -40,7 +40,8 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--merged-dir", type=Path, default=repo_root / "data" / "merged")
-    parser.add_argument("--split", choices=["train", "val"], default="train")
+    parser.add_argument("--prefix", default="pretrain", help="pretrain or indomain")
+    parser.add_argument("--split", choices=["train", "val", "test"], default="train")
     parser.add_argument("--count", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out-dir", type=Path, default=None)
@@ -49,7 +50,7 @@ def main() -> None:
     merged_dir = args.merged_dir.resolve()
     out_dir = (args.out_dir or (merged_dir / "preview")).resolve()
 
-    coco_path = merged_dir / f"pretrain_{args.split}.json"
+    coco_path = merged_dir / f"{args.prefix}_{args.split}.json"
     with coco_path.open(encoding="utf-8") as f:
         coco = json.load(f)
 

@@ -208,8 +208,34 @@ def merge_all(
     return kept_images, all_annotations, stats, dropped_empty_images
 
 
+def build_coco_annotation(ann_id: int, image_global_id: int, segmentation: list, unreadable: bool = False) -> dict:
+    """Assembles one output COCO annotation dict — shared by
+    write_merged_dataset (pretrain) and convert_labelstudio_export.py
+    (indomain) so the two can never quietly drift apart on bbox/area
+    computation. `unreadable` is our own additive field (plan §3/§8) — not
+    standard COCO, but harmless to consumers that ignore unknown keys."""
+    coords = segmentation[0]
+    xs = coords[0::2]
+    ys = coords[1::2]
+    bbox = [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
+    return {
+        "id": ann_id,
+        "image_id": image_global_id,
+        "category_id": SPINE_CATEGORY_ID,
+        "segmentation": segmentation,
+        "bbox": bbox,
+        "area": polygon_area(coords),
+        "iscrowd": 0,
+        "unreadable": unreadable,
+    }
+
+
 def write_merged_dataset(
-    kept_images: list[dict], all_annotations: list[dict], out_dir: Path
+    kept_images: list[dict],
+    all_annotations: list[dict],
+    out_dir: Path,
+    splits: tuple[str, ...] = ("train", "val"),
+    filename_prefix: str = "pretrain",
 ) -> dict[str, dict]:
     images_out_dir = out_dir / "images"
     images_out_dir.mkdir(parents=True, exist_ok=True)
@@ -222,7 +248,7 @@ def write_merged_dataset(
                 {"id": SPINE_CATEGORY_ID, "name": SPINE_CATEGORY_NAME, "supercategory": "none"}
             ],
         }
-        for split in ("train", "val")
+        for split in splits
     }
 
     for i, img in enumerate(kept_images, start=1):
@@ -243,25 +269,13 @@ def write_merged_dataset(
     ann_id_counter = 1
     for ann in all_annotations:
         img = ann["_image_ref"]
-        coords = ann["segmentation"][0]
-        xs = coords[0::2]
-        ys = coords[1::2]
-        bbox = [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
         coco_by_split[img["_split"]]["annotations"].append(
-            {
-                "id": ann_id_counter,
-                "image_id": img["_global_id"],
-                "category_id": SPINE_CATEGORY_ID,
-                "segmentation": ann["segmentation"],
-                "bbox": bbox,
-                "area": polygon_area(coords),
-                "iscrowd": 0,
-            }
+            build_coco_annotation(ann_id_counter, img["_global_id"], ann["segmentation"], ann.get("_unreadable", False))
         )
         ann_id_counter += 1
 
-    for split in ("train", "val"):
-        with (out_dir / f"pretrain_{split}.json").open("w", encoding="utf-8") as f:
+    for split in splits:
+        with (out_dir / f"{filename_prefix}_{split}.json").open("w", encoding="utf-8") as f:
             json.dump(coco_by_split[split], f)
 
     return coco_by_split
