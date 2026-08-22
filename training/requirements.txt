@@ -1,0 +1,6 @@
+# Data pipeline dependencies only (merge + augmentation preview).
+# merge_datasets.py itself needs none of these — stdlib only, by design
+# (see its module docstring: avoids sharing the Python-3.14 wheel-
+# availability risk that PyTorch/onnxruntime may hit later, plan §12).
+Pillow==12.3.0
+albumentations==2.0.8
