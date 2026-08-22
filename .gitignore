@@ -11,3 +11,7 @@ data/raw/*/*
 # Merged/derived dataset: regenerable from data/raw/ via merge_datasets.py,
 # 94MB of copied images — don't commit build output.
 data/merged/
+
+# Your own home photos + labels (plan §3). Never commit these — real
+# photos of real homes, unlike the public data above.
+data/indomain/
