@@ -1,0 +1,30 @@
+<!--
+  Label Studio labeling interface for the in-domain spine dataset (plan §3).
+  Paste this into Label Studio: create a project -> Settings -> Labeling
+  Interface -> Code, replace the default template with this, Save.
+
+  Not run through a live Label Studio instance (the full package didn't
+  finish installing here in a reasonable time — Django-based, heavy). This
+  is written to the documented tag schema (Image/PolygonLabels/Choices);
+  Label Studio's own editor shows a live preview immediately on paste, so
+  that's the real check — if something's wrong it'll be obvious at once.
+-->
+<View>
+  <Image name="image" value="$image" zoom="true" zoomControl="true" rotateControl="true"/>
+
+  <!-- Single class on purpose (plan §3): a non_book class only gets added
+       later if evaluation shows false positives are an actual problem. -->
+  <PolygonLabels name="spine" toName="image" strokeWidth="2" pointSize="small" opacity="0.3">
+    <Label value="spine" background="#F44336"/>
+  </PolygonLabels>
+
+  <!-- Per-region, not per-image: attaches to whichever polygon is
+       currently selected. Left unchecked (the common case, most spines
+       ARE readable) rather than a forced choice, to keep annotation speed
+       reasonable across ~1,200 expected instances (200 images x ~6 spines).
+       This flag is what keeps §8's read-accuracy metric honest — without
+       it, the detector gets penalized for spines no VLM could ever read. -->
+  <Choices name="unreadable" toName="image" perRegion="true" choice="multiple" showInline="true">
+    <Choice value="unreadable"/>
+  </Choices>
+</View>
