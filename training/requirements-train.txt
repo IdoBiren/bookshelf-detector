@@ -1,0 +1,12 @@
+# Model/export dependencies (plan §13 phase A). Deliberately SEPARATE from
+# requirements.txt: merge_datasets.py stays stdlib-only and the data
+# pipeline must never depend on torch.
+#
+# Installed into training/.venv rather than the system Python — not because
+# of wheel availability (all four DO have Python 3.14 wheels, contrary to
+# the earlier HANDOFF assumption) but to keep torch away from the working
+# label-studio install, which was expensive to get running.
+torch==2.13.0
+torchvision==0.28.0
+onnx==1.22.0
+onnxruntime==1.29.0

@@ -79,11 +79,31 @@ cd training && python -m unittest discover -s tests   # 38/38 (pipeline/Python)
 | `data/merged/indomain_{train,val,test}.json` | 12 / 3 / 2 images · 131 / 36 / 13 annotations |
 | `data/indomain/photos/` | **165 own photos**, 17 labeled so far |
 
+⚠️ **All 165 photos are `sceneNNN.jpg`, one photo per scene id** — 165
+distinct scenes, zero multi-shot groups. LABELING.md's scene-grouping rule
+assumed several shots would share a prefix. If every photo really is a
+different shelf, nothing is wrong and splitting is trivially leak-free. If
+any two of them are the same shelf from different angles, they are currently
+in *different* scenes and can land on opposite sides of the split — which is
+precisely the leakage the mechanism exists to stop (it made 43% of
+harald-varner's public split unusable). **Cheap to fix by renaming now,
+painful after labeling**, since Label Studio tasks key on filename.
+
 ---
 
 ## The immediate next step
 
-**Keep labeling** `data/indomain/photos/` — 148 of 165 photos still to go.
+**Label the ~40-photo eval set first** — hand-picked and stratified across
+§3's six scenarios, not the next 40 in order. It is what blocks the ship
+decision; the remaining ~125 fine-tune photos get **pre-annotated by the
+pretrained model** from phase D and only reviewed by hand (decided
+2026-08-26). Declare the chosen scenes with `--test-scenes` — see
+LABELING.md, "The eval set comes first".
+
+**Do not pre-annotate the eval set itself.** A wrong polygon is easy to
+correct; a *missing* one is nearly invisible to a reviewer, so the model's
+own blind spots get baked into the ground truth and recall reads higher
+than it is — in the exact metric that decides shipping.
 Photos are already shot and scene-named; only annotation remains.
 `training/LABELING.md` has the rules (trace tight to spine edges; label
 books lying flat and edge-cropped spines; skip non-books; flag genuinely
@@ -154,10 +174,22 @@ trivial model before betting days on the real one. Don't skip it.
 
 - **Working, verified by running them:** Pillow 12.3.0, Albumentations
   2.0.8, numpy 2.5.2, opencv 5.0.0, scipy, label-studio 1.23.0.
-- **PyTorch and onnxruntime are UNVERIFIED** and may not have 3.14 wheels.
-  Colab has its own Python so training is unaffected — but the §5 parity
-  check needs onnxruntime *locally in Python* to diff against JS, so
-  budget for a separate 3.11/3.12 env before Stage 8.
+- **PyTorch and onnxruntime DO have Python 3.14 wheels** — the earlier
+  "may need a 3.11/3.12 env" worry is resolved, verified against the index:
+  `torch 2.13.0` (cp314), `torchvision 0.28.0` (cp314),
+  `onnxruntime 1.29.0` (cp314), `onnx 1.22.0` (cp312-abi3, so it loads on
+  3.14). No downgrade needed anywhere, including for the §5 parity check.
+- **They still live in `training/.venv`, not the system Python** — for a
+  different reason than wheels: keeping torch away from the working
+  label-studio install, which was expensive to get running and pins its own
+  dependencies. `training/requirements-train.txt` is separate from
+  `requirements.txt`; `merge_datasets.py` stays stdlib-only.
+- **This machine's network drops large downloads.** pip died repeatedly
+  mid-wheel with `Failed to resolve files.pythonhosted.org` after ~3MB of
+  122MB, and albumentations' version check times out its SSL handshake.
+  DNS and ranged GETs both work — it is flakiness, not a block. For big
+  wheels, `curl -L -C - --retry 15 --retry-all-errors` to disk and then
+  `pip install <file>` rather than fighting pip's own retry logic.
 - `merge_datasets.py` is deliberately **stdlib-only** so the data pipeline
   never shares that risk. Keep it that way.
 

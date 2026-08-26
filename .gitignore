@@ -15,3 +15,6 @@ data/merged/
 # Your own home photos + labels (plan §3). Never commit these — real
 # photos of real homes, unlike the public data above.
 data/indomain/
+
+# Phase A training env (torch/onnx) — kept out of the working label-studio install.
+training/.venv/

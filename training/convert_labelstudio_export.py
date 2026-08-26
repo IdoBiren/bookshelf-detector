@@ -45,6 +45,67 @@ def scene_id_from_basename(basename: str) -> str:
     return _EXPLORER_SUFFIX_RE.sub("", Path(basename).stem)
 
 
+def load_test_scenes(path: Path) -> set[str]:
+    """Reads the frozen eval set's scene ids, one per line ('#' comments and
+    blank lines ignored).
+
+    Entries run through scene_id_from_basename, so a list built the natural
+    way — copying filenames out of the photos folder, Explorer's
+    "scene008 (2).jpg" numbering included — works as well as bare scene ids.
+
+    An effectively empty file raises: silently producing no forced test set
+    would fall back to the random split this flag exists to replace.
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    scenes = {
+        scene_id_from_basename(stripped)
+        for line in lines
+        if (stripped := line.strip()) and not stripped.startswith("#")
+    }
+    if not scenes:
+        raise ValueError(f"No scene ids found in {path} (only blank lines and comments?)")
+    return scenes
+
+
+def load_scene_groups(path: Path) -> dict[str, str]:
+    """Reads the scene-grouping file written by group_scenes.py and returns
+    {member scene id -> canonical scene id}. One comma-separated line per scene, the
+    first entry naming it; '#' comments and blank lines ignored.
+
+    Needed because every in-domain photo arrived as its own sceneNNN.jpg even
+    though EXIF shows they were shot in bursts — several photos per shelf.
+    Ungrouped scene ids simply stay themselves, so a partial file is valid.
+
+    A scene id listed in two groups raises: after a hand edit that is almost
+    certainly a photo moved but not deleted from its old line, and picking
+    either silently would put it in a split its group-mates are not in.
+    """
+    canonical_by_member: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Comma-separated, not whitespace: Explorer's bulk-rename numbering
+        # puts a space inside the filename ("scene008 (2).jpg"), so splitting
+        # on whitespace invents a bogus "(2)" scene. Caught by a test.
+        members = [
+            scene_id_from_basename(part.strip())
+            for part in stripped.split(",")
+            if part.strip()
+        ]
+        for member in members:
+            if member in canonical_by_member and canonical_by_member[member] != members[0]:
+                raise ValueError(
+                    f"Scene {member!r} appears in two different groups in {path} "
+                    f"({canonical_by_member[member]!r} and {members[0]!r}). "
+                    "Remove it from one of them."
+                )
+            canonical_by_member[member] = members[0]
+    if not canonical_by_member:
+        raise ValueError(f"No scene groups found in {path} (only blank lines and comments?)")
+    return canonical_by_member
+
+
 def resolve_local_file_path(file_name: str, photos_dir: Path) -> Path:
     """Label Studio Local Files storage exports file_name as
     "/data/local-files/?d=<url-encoded-path-relative-to-document-root>".
@@ -58,10 +119,40 @@ def resolve_local_file_path(file_name: str, photos_dir: Path) -> Path:
 
 
 def three_way_split_scenes(
-    scene_ids: list[str], val_fraction: float, test_fraction: float, seed: int
+    scene_ids: list[str],
+    val_fraction: float,
+    test_fraction: float,
+    seed: int,
+    forced_test_scenes: set[str] | None = None,
 ) -> dict[str, str]:
     """Composes split_scenes_by_id twice to get train/val/test (70/15/15
-    by default) instead of writing separate 3-way split logic."""
+    by default) instead of writing separate 3-way split logic.
+
+    With `forced_test_scenes`, test stops being random: exactly those scenes
+    become the test split and everything else splits train/val by
+    val_fraction (plan §13). `test_fraction` is then unused — the benchmark's
+    size is whatever was declared, not a percentage.
+
+    Why this exists: at 165 photos a random 15% test split is ~25 images,
+    below the 40-60 §8's evaluation protocol requires, and the eval set has
+    to be a *stratified* hand-pick across §3's six scenarios rather than a
+    random draw, or the benchmark misses the hard cases and the numbers come
+    out optimistically wrong.
+    """
+    if forced_test_scenes:
+        unknown = forced_test_scenes - set(scene_ids)
+        if unknown:
+            raise ValueError(
+                f"Test scenes not present in the export: {sorted(unknown)}. "
+                "Either they are not labeled yet, or the id is a typo. Refusing "
+                "to continue: silently dropping them would shrink the frozen "
+                "eval set below what plan §8 requires while still reporting success."
+            )
+        remainder = [s for s in scene_ids if s not in forced_test_scenes]
+        result = dict(split_scenes_by_id(remainder, val_fraction, seed))
+        result.update({s: "test" for s in forced_test_scenes})
+        return result
+
     holdout_fraction = val_fraction + test_fraction
     stage1 = split_scenes_by_id(scene_ids, holdout_fraction, seed)
     train_scenes = [s for s, split in stage1.items() if split == "train"]
@@ -82,6 +173,8 @@ def convert(
     val_fraction: float,
     test_fraction: float,
     seed: int,
+    forced_test_scenes: set[str] | None = None,
+    scene_groups: dict[str, str] | None = None,
 ) -> tuple[list[dict], list[dict], dict[str, int]]:
     with export_path.open(encoding="utf-8") as f:
         data = json.load(f)
@@ -103,7 +196,10 @@ def convert(
             continue
         img["_dataset"] = "indomain"
         img["_source_path"] = str(resolved)
-        img["_scene_id"] = scene_id_from_basename(resolved.name)
+        raw_scene_id = scene_id_from_basename(resolved.name)
+        # Several photos of one shelf share a scene so they cannot straddle
+        # the split; without a groups file each photo stays its own scene.
+        img["_scene_id"] = (scene_groups or {}).get(raw_scene_id, raw_scene_id)
         # write_merged_dataset builds the output filename from file_name —
         # overwrite Label Studio's raw "/data/local-files/?d=..." URL with
         # the real basename, or it ends up as a literal (invalid) filename.
@@ -136,7 +232,14 @@ def convert(
     stats["dropped_empty_images"] = len([i for i in images_by_id.values() if "_source_path" in i]) - len(kept_images)
 
     scene_ids = [img["_scene_id"] for img in kept_images]
-    split_assignment = three_way_split_scenes(scene_ids, val_fraction, test_fraction, seed)
+    if forced_test_scenes and scene_groups:
+        # You pick eval photos by looking at them, so you name whichever photo
+        # you were looking at — not necessarily its group's canonical id.
+        forced_test_scenes = {scene_groups.get(s, s) for s in forced_test_scenes}
+    split_assignment = three_way_split_scenes(
+        scene_ids, val_fraction, test_fraction, seed, forced_test_scenes
+    )
+    stats["scenes_after_grouping"] = len(set(scene_ids))
     for img in kept_images:
         img["_split"] = split_assignment[img["_scene_id"]]
 
@@ -152,10 +255,35 @@ def main() -> None:
     parser.add_argument("--val-fraction", type=float, default=0.15)
     parser.add_argument("--test-fraction", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--test-scenes",
+        type=Path,
+        default=None,
+        help="File of scene ids (one per line) to force into the test split — the frozen, "
+        "hand-stratified eval set (plan §8/§13). The remainder then splits train/val by "
+        "--val-fraction and --test-fraction is ignored. Without it, test is a random 15%%.",
+    )
+    parser.add_argument(
+        "--scene-groups",
+        type=Path,
+        default=None,
+        help="File grouping photos of the same physical shelf into one scene, as written by "
+        "group_scenes.py. Without it every photo is treated as an independent scene — which is "
+        "wrong for burst shots and silently inflates every validation number.",
+    )
     args = parser.parse_args()
 
+    forced_test_scenes = load_test_scenes(args.test_scenes.resolve()) if args.test_scenes else None
+    scene_groups = load_scene_groups(args.scene_groups.resolve()) if args.scene_groups else None
+
     kept_images, kept_annotations, stats = convert(
-        args.export.resolve(), args.photos_dir.resolve(), args.val_fraction, args.test_fraction, args.seed
+        args.export.resolve(),
+        args.photos_dir.resolve(),
+        args.val_fraction,
+        args.test_fraction,
+        args.seed,
+        forced_test_scenes,
+        scene_groups,
     )
 
     scene_to_splits: dict[str, set] = {}
@@ -177,6 +305,14 @@ def main() -> None:
     print(f"Kept annotations: {len(kept_annotations)}")
     print(f"Stats: {stats}")
     print(f"Unique scenes: {len(scene_to_splits)}")
+    if scene_groups:
+        print(f"Scene grouping: {args.scene_groups}")
+    else:
+        print("Scene grouping: NONE — every photo treated as its own scene")
+    if forced_test_scenes:
+        print(f"Test split: FORCED from {args.test_scenes} ({len(forced_test_scenes)} scenes)")
+    else:
+        print("Test split: random by scene (no --test-scenes given)")
     for split in ("train", "val", "test"):
         print(
             f"{split.capitalize()}: {len(coco_by_split[split]['images'])} images, "

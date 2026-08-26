@@ -8,6 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from convert_labelstudio_export import (  # noqa: E402
     convert,
+    load_scene_groups,
+    load_test_scenes,
     resolve_local_file_path,
     scene_id_from_basename,
     three_way_split_scenes,
@@ -62,6 +64,220 @@ class TestThreeWaySplitScenes(unittest.TestCase):
         assignment = three_way_split_scenes(scenes, 0.15, 0.15, seed=1)
         self.assertEqual(set(assignment.keys()), set(scenes))
         self.assertTrue(all(v in ("train", "val", "test") for v in assignment.values()))
+
+
+class TestForcedTestScenes(unittest.TestCase):
+    """plan §13 (מסלול מקביל): the ~40 stratified eval photos are chosen by
+    hand, not by a random 15%. At 165 photos a random test split yields ~25
+    images — short of the 40-60 §8's evaluation protocol requires — and there
+    was no way to say "THESE scenes are the benchmark". Forcing them fixes
+    both."""
+
+    def test_forced_scenes_all_land_in_test(self):
+        scenes = [f"scene{i:03d}" for i in range(20)]
+        forced = {"scene003", "scene007", "scene011"}
+        assignment = three_way_split_scenes(scenes, 0.15, 0.15, seed=42, forced_test_scenes=forced)
+        for s in forced:
+            self.assertEqual(assignment[s], "test")
+
+    def test_remaining_scenes_split_train_val_only_never_test(self):
+        """The point of forcing: test is EXACTLY the declared benchmark set.
+        A stray random scene leaking into test would silently contaminate the
+        frozen eval set."""
+        scenes = [f"scene{i:03d}" for i in range(20)]
+        forced = {"scene003", "scene007"}
+        assignment = three_way_split_scenes(scenes, 0.15, 0.15, seed=42, forced_test_scenes=forced)
+        for scene, split in assignment.items():
+            if scene not in forced:
+                self.assertIn(split, ("train", "val"), f"{scene} leaked into test")
+        in_test = {s for s, split in assignment.items() if split == "test"}
+        self.assertEqual(in_test, forced)
+
+    def test_remainder_splits_85_15_not_70_15_15(self):
+        """test_fraction is ignored when scenes are forced — the remainder is
+        train/val only, so val_fraction applies to the REMAINDER."""
+        scenes = [f"scene{i:03d}" for i in range(100)]
+        forced = {f"scene{i:03d}" for i in range(20)}
+        assignment = three_way_split_scenes(scenes, 0.15, 0.15, seed=42, forced_test_scenes=forced)
+        counts = {"train": 0, "val": 0, "test": 0}
+        for split in assignment.values():
+            counts[split] += 1
+        self.assertEqual(counts["test"], 20)
+        self.assertEqual(counts["val"], 12)   # 15% of the 80 remaining
+        self.assertEqual(counts["train"], 68)
+
+    def test_every_scene_still_assigned_exactly_once(self):
+        scenes = [f"scene{i:03d}" for i in range(20)]
+        forced = {"scene003"}
+        assignment = three_way_split_scenes(scenes, 0.15, 0.15, seed=3, forced_test_scenes=forced)
+        self.assertEqual(set(assignment.keys()), set(scenes))
+
+    def test_unknown_scene_in_file_raises_rather_than_silently_shrinking_the_eval_set(self):
+        """A typo'd scene id must be loud. Silently dropping it would shrink
+        the benchmark below the 40-60 §8 requires while still reporting
+        'PASSED' — exactly the failure this flag exists to prevent."""
+        scenes = [f"scene{i:03d}" for i in range(5)]
+        with self.assertRaises(ValueError) as ctx:
+            three_way_split_scenes(scenes, 0.15, 0.15, seed=1, forced_test_scenes={"scene002", "scene999"})
+        self.assertIn("scene999", str(ctx.exception))
+        self.assertNotIn("scene002", str(ctx.exception))
+
+    def test_empty_forced_set_behaves_exactly_like_before(self):
+        scenes = [f"scene{i:03d}" for i in range(50)]
+        baseline = three_way_split_scenes(scenes, 0.15, 0.15, seed=42)
+        for forced in (None, set()):
+            self.assertEqual(
+                three_way_split_scenes(scenes, 0.15, 0.15, seed=42, forced_test_scenes=forced),
+                baseline,
+            )
+
+
+class TestLoadTestScenes(unittest.TestCase):
+    def test_reads_one_scene_per_line_ignoring_blanks_and_comments(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            f = Path(tmpdir) / "eval_scenes.txt"
+            f.write_text(
+                "\n".join(["# the frozen eval set (plan section 8)", "scene001", "", "scene002", "  scene003  "]),
+                encoding="utf-8",
+            )
+            self.assertEqual(load_test_scenes(f), {"scene001", "scene002", "scene003"})
+
+    def test_accepts_pasted_filenames_not_just_bare_scene_ids(self):
+        """Normalised through scene_id_from_basename, because the natural way
+        to build this list is to copy filenames out of the photos folder —
+        including Explorer's "scene008 (2).jpg" auto-numbering."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            f = Path(tmpdir) / "eval_scenes.txt"
+            f.write_text("\n".join(["scene007.jpg", "scene008 (2).jpg", "scene009"]), encoding="utf-8")
+            self.assertEqual(load_test_scenes(f), {"scene007", "scene008", "scene009"})
+
+    def test_empty_file_raises_rather_than_silently_producing_no_test_set(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            f = Path(tmpdir) / "eval_scenes.txt"
+            f.write_text("# nothing but a comment", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_test_scenes(f)
+
+
+class TestLoadSceneGroups(unittest.TestCase):
+    """plan §3 / LABELING.md. Every in-domain photo arrived named sceneNNN.jpg,
+    one id each — but EXIF shows all 165 were shot in one 30-minute session with
+    139 of 164 consecutive gaps under 5 seconds, i.e. bursts of the same shelf.
+    Without regrouping, near-duplicate shots land on both sides of the split:
+    the leakage that made harald-varner's own public split unusable."""
+
+    def _write(self, tmpdir, text):
+        f = Path(tmpdir) / "scene_groups.txt"
+        f.write_text(text, encoding="utf-8")
+        return f
+
+    def test_first_entry_names_the_scene(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            f = self._write(tmpdir, "\n".join(["scene001, scene002, scene003", "scene004, scene005"]))
+            self.assertEqual(
+                load_scene_groups(f),
+                {
+                    "scene001": "scene001",
+                    "scene002": "scene001",
+                    "scene003": "scene001",
+                    "scene004": "scene004",
+                    "scene005": "scene004",
+                },
+            )
+
+    def test_ignores_comments_and_blank_lines_and_accepts_filenames(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            f = self._write(tmpdir, "\n".join(["# proposed from EXIF", "", "scene007.jpg, scene008 (2).jpg"]))
+            self.assertEqual(load_scene_groups(f), {"scene007": "scene007", "scene008": "scene007"})
+
+    def test_a_photo_in_two_groups_raises(self):
+        """Hand-edited file, so a photo left in its old group after being moved
+        is the likely mistake. Silently picking one would put it in a split the
+        other group's photos are not in — leakage, reported as success."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            f = self._write(tmpdir, "\n".join(["scene001, scene002", "scene003, scene002"]))
+            with self.assertRaises(ValueError) as ctx:
+                load_scene_groups(f)
+            self.assertIn("scene002", str(ctx.exception))
+
+
+class TestGroupingAppliedInConvert(unittest.TestCase):
+    def _export_with_two_photos(self, tmpdir):
+        photos_dir = Path(tmpdir) / "photos"
+        photos_dir.mkdir()
+        images, annotations = [], []
+        for index, name in enumerate(("scene001.jpg", "scene002.jpg"), start=1):
+            (photos_dir / name).write_bytes(b"not a real jpeg, only existence is checked")
+            images.append(
+                {
+                    "id": index,
+                    "file_name": "/data/local-files/?d=photos/" + name,
+                    "width": 800,
+                    "height": 600,
+                }
+            )
+            annotations.append(
+                {
+                    "id": index,
+                    "image_id": index,
+                    "category_id": 1,
+                    "segmentation": VALID_SEG,
+                    "bbox": [0, 0, 100, 100],
+                    "area": 10000,
+                    "iscrowd": 0,
+                }
+            )
+        export = _write_export(Path(tmpdir), images, annotations, [{"id": 1, "name": "spine"}])
+        return export, photos_dir
+
+    def test_grouped_photos_share_a_split(self):
+        """The whole point: two shots of one shelf must never straddle the
+        train/val/test boundary."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export, photos_dir = self._export_with_two_photos(tmpdir)
+            groups_file = Path(tmpdir) / "scene_groups.txt"
+            groups_file.write_text("scene001, scene002", encoding="utf-8")
+
+            kept_images, _, _ = convert(
+                export, photos_dir, 0.5, 0.0, seed=1, scene_groups=load_scene_groups(groups_file)
+            )
+            splits = {img["file_name"]: img["_split"] for img in kept_images}
+            self.assertEqual(len(splits), 2)
+            self.assertEqual(len(set(splits.values())), 1, f"grouped photos were split apart: {splits}")
+
+    def test_ungrouped_run_can_split_the_same_two_photos_apart(self):
+        """Guards the test above from being vacuous — without grouping, this
+        exact seed and fraction does separate them."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export, photos_dir = self._export_with_two_photos(tmpdir)
+            kept_images, _, _ = convert(export, photos_dir, 0.5, 0.0, seed=1)
+            splits = {img["_split"] for img in kept_images}
+            self.assertEqual(len(splits), 2)
+
+    def test_forced_test_scene_may_be_named_by_any_member_of_its_group(self):
+        """You pick eval photos by looking at them, so you name whichever one
+        you were looking at — not necessarily the one that happens to be its
+        group's canonical id."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export, photos_dir = self._export_with_two_photos(tmpdir)
+            groups = load_scene_groups(
+                self._write_groups(Path(tmpdir), "scene001, scene002")
+            )
+            kept_images, _, _ = convert(
+                export,
+                photos_dir,
+                0.0,
+                0.0,
+                seed=1,
+                scene_groups=groups,
+                forced_test_scenes={"scene002"},
+            )
+            self.assertEqual({img["_split"] for img in kept_images}, {"test"})
+
+    def _write_groups(self, tmpdir, text):
+        f = tmpdir / "scene_groups.txt"
+        f.write_text(text, encoding="utf-8")
+        return f
 
 
 def _write_export(tmp: Path, images: list, annotations: list, categories: list) -> Path:
