@@ -64,10 +64,16 @@ Hard constraints that drove every decision (§0–§1):
 | 10 · Crop-padding calibration | ⬜ Blocked on 9 |
 | 11 · Full evaluation vs ship thresholds | ⬜ Blocked on 10 |
 
+**This table predates plan §13's phase A-E restructure — phase B (target
+generation + shrink_ratio validation, see "Open questions" §1 above) is
+done and landed a NO-GO finding that phase C/D should read before
+proceeding. Stage 7's calibration is no longer a blind sweep — the
+`unclip_ratio` finding above feeds it directly.**
+
 **Tests, both green as of this handoff:**
 ```bash
-npx vitest run                                    # 22/22 (browser/TS)
-cd training && python -m unittest discover -s tests   # 38/38 (pipeline/Python)
+npx vitest run                                         # 34/34 (browser/TS)
+cd training && python -m unittest discover -s tests    # 112/112 (pipeline/Python)
 ```
 
 ### Data on disk (all gitignored — never commit)
@@ -246,12 +252,66 @@ trivial model before betting days on the real one. Don't skip it.
 
 ## Open questions for whoever picks this up
 
-1. **`shrink_ratio` / `unclip_ratio` are tuned for text lines, not books**
-   — DBNet expects many *small* instances; we have 5–8 *large* ones.
-   `shrink_ratio=0.4` on a 400px-tall spine shrinks far more aggressively
-   than on a 20px text line. This is the biggest unknown in the whole
-   architecture recommendation (§10.2) and may need a change to
-   target *generation*, not just a parameter sweep.
+1. ~~**`shrink_ratio` / `unclip_ratio` are tuned for text lines, not books**~~
+   **— MEASURED, plan §13 phase B. Verdict: NO-GO on `shrink_ratio=0.4` as
+   shipped, at every stride tested.** `training/measure_shrink_ratio.py`
+   (`training/dbnet_targets.py` + `training/polygon_offset.py`, 112 tests)
+   ran the two defined metrics on real annotations, quad-mode (the shape
+   `postprocess.ts:64` actually expands):
+
+   | dataset | stride | canvas | merged pairs | vanished | verdict |
+   |---|---|---|---|---|---|
+   | indomain_train (12 img/131 ann) | 1 | 640² | 0.00% | **1.53%** | NO-GO |
+   | indomain_train | 4 | 160² | 0.00% | **1.53%** | NO-GO |
+   | pretrain_train (1440 img/27109 ann) | 1 | 640² | 0.56% | **1.59%** | NO-GO |
+   | pretrain_train | 4 | 160² | **6.56%** | **5.56%** | NO-GO |
+
+   Thresholds: merged pairs >5%, vanished >1%.
+
+   **Two separate, independent problems, not one:**
+   - **A real geometric bug, present even at full 640×640 resolution
+     (stride 1).** Uniform per-edge shrink (the DBNet formula, mirrored
+     exactly from `unclip.ts` — not a training-side reimplementation bug)
+     self-intersects on *tapering* quads: a trapezoid whose two ends have
+     different widths, where the narrower end's width is less than
+     roughly `2 × shrink_distance`. Confirmed on real spines in both
+     datasets, e.g. an indomain quad with edges `[365, 14, 362, 35]` —
+     the 14px end inverts under a ~3px shrink applied from both long
+     sides. This is a genuine property of the shared shrink/unclip
+     algorithm on non-parallel-sided quads, not a resolution artifact —
+     it will not go away by picking a different stride. An earlier
+     informal exploration during planning reported 0.00% vanished at
+     stride 1 for `pretrain`; that number is superseded — it did not
+     include a self-intersection check (`is_simple_polygon`), only area.
+   - **A resolution problem, additional to the above, at stride 4.**
+     Merged pairs jump from 0.56%→6.56% and vanished from 1.59%→5.56%
+     between stride 1 and stride 4 on `pretrain` — DBNet's usual
+     1/4-resolution head is not viable for book spines; **stride 1 (full
+     640×640 target maps) is required**, confirming §13's original
+     resolution concern.
+
+   **Not yet resolved, needs a decision before Phase C:** since the
+   vanish/merge rate is small (~1.5%) and driven by shape (tapering),
+   not systemic geometry breakage, the pragmatic options are (a) accept
+   it — the code already turns a failed polygon into an ignore region,
+   not a crash or corrupted target, so ~1.5% fewer supervised pixels per
+   epoch may simply be acceptable; or (b) a shape-aware shrink (smaller
+   effective ratio, or width-relative rather than uniform) for quads
+   whose two end-widths differ significantly. Whoever picks up Phase C
+   should decide which, and should NOT change `polygon_offset.py`'s core
+   offset algorithm to "fix" this — it is a deliberate mirror of the
+   shipped `unclip.ts`, and diverging breaks the shrink/unclip inverse
+   property the whole module exists to guarantee.
+
+   Also measured in the same pass: `postprocess.ts`'s shipped
+   `unclip_ratio=1.5` is **not** the inverse of `shrink_ratio=0.4` for
+   spine aspect ratios (a 66×355 quad — the median indomain spine size at
+   640 input — round-trips to >5px corner error). The exact inverse is
+   aspect-ratio-dependent (`training/polygon_offset.py`'s
+   `exact_unclip_distance`, closed-form, 0.0 error on real quads) — a
+   single scalar `unclip_ratio` cannot be exactly correct for both a
+   200×200 and a 25×400 spine simultaneously. Relevant to Stage 7
+   calibration, not yet acted on.
 2. **int8 on WebGPU is unverified** (§5). If it silently falls back to CPU,
    p95 blows past 2.5s and we're stuck with fp16 at ~5MB — which turns the
    2.5M-param budget from a guideline into a hard ceiling.
