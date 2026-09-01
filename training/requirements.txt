@@ -4,3 +4,9 @@
 # availability risk that PyTorch/onnxruntime may hit later, plan §12).
 Pillow==12.3.0
 albumentations==2.0.8
+# numpy/opencv previously arrived only transitively via albumentations;
+# pinned explicitly now that dbnet_targets.py (plan §13 phase B) depends on
+# them directly, so an albumentations version bump can't silently change
+# what this repo actually runs against.
+numpy==2.5.2
+opencv-python-headless==5.0.0.93
