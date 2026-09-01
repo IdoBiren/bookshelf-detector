@@ -124,14 +124,23 @@ def load_scene_groups(path: Path) -> dict[str, str]:
 
 
 def resolve_local_file_path(file_name: str, photos_dir: Path) -> Path:
-    """Label Studio Local Files storage exports file_name as
-    "/data/local-files/?d=<url-encoded-path-relative-to-document-root>".
-    We already know exactly where the real files live, so only the
-    basename matters here."""
+    """Label Studio hands back file_name in two DIFFERENT shapes depending on
+    export path, both observed on real exports:
+
+    - the raw API export: "/data/local-files/?d=<url-encoded-relative-path>"
+    - the COCO zip export (Export -> COCO in the UI): a query-string-free
+      "images\\<8-hex-hash>__<url-encoded-source-path>", e.g.
+      "images\\b358c755__photos%5Cscene001.jpg"
+
+    We already know exactly where the real files live, so only the basename
+    matters in either case -- unquote first (the COCO shape's separator is
+    itself URL-encoded), normalise backslashes, then take the last segment.
+    """
     parsed = urllib.parse.urlparse(file_name)
     query = urllib.parse.parse_qs(parsed.query)
     relative = query.get("d", [file_name])[0]
-    basename = Path(relative.replace("\\", "/")).name
+    unquoted = urllib.parse.unquote(relative)
+    basename = Path(unquoted.replace("\\", "/")).name
     return photos_dir / basename
 
 

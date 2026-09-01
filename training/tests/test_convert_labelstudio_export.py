@@ -45,6 +45,23 @@ class TestResolveLocalFilePath(unittest.TestCase):
         result = resolve_local_file_path("/data/local-files/?d=photos/scene002.jpg", photos_dir)
         self.assertEqual(result, photos_dir / "scene002.jpg")
 
+    def test_decodes_the_coco_zip_export_format(self):
+        """The COCO export downloaded from the UI (Export -> COCO -> zip) uses
+        a DIFFERENT file_name shape than the raw API export the other two
+        tests cover: "images\\<8-hex-hash>__<url-encoded-source-path>", no
+        query string at all. First observed on a real export -- the smoke
+        test this fixture is named after."""
+        photos_dir = Path("C:/fake/photos")
+        result = resolve_local_file_path(
+            "images\\b358c755__photos%5Cscene001.jpg", photos_dir
+        )
+        self.assertEqual(result, photos_dir / "scene001.jpg")
+
+    def test_coco_zip_export_format_with_forward_slashes(self):
+        photos_dir = Path("C:/fake/photos")
+        result = resolve_local_file_path("images/b358c755__photos%5Cscene001.jpg", photos_dir)
+        self.assertEqual(result, photos_dir / "scene001.jpg")
+
 
 class TestThreeWaySplitScenes(unittest.TestCase):
     def test_ratio_is_approximately_respected(self):
