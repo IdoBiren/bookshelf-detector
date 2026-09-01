@@ -67,6 +67,33 @@ def load_test_scenes(path: Path) -> set[str]:
     return scenes
 
 
+def parse_groups_file(path: Path) -> list[list[str]]:
+    """Reads the scene-grouping file into ordered groups of raw file stems.
+
+    Shared deliberately with group_scenes.py rather than parsed twice: the two
+    scripts write and read the same file, and a format drift between them
+    would be silent. (Same reasoning as write_merged_dataset being shared
+    between the pretrain merge and this converter.)
+
+    Returns stems, NOT scene ids — the extension is dropped but Explorer's
+    " (2)" bulk-rename suffix is preserved, because group_scenes.py needs the
+    real filename back to find the photo on disk. load_scene_groups narrows
+    these to scene ids for its own purposes.
+    """
+    groups: list[list[str]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Comma-separated, not whitespace: Explorer's bulk-rename numbering
+        # puts a space inside the filename ("scene008 (2).jpg"), so splitting
+        # on whitespace invents a bogus "(2)" scene. Caught by a test.
+        members = [Path(part.strip()).stem for part in stripped.split(",") if part.strip()]
+        if members:
+            groups.append(members)
+    return groups
+
+
 def load_scene_groups(path: Path) -> dict[str, str]:
     """Reads the scene-grouping file written by group_scenes.py and returns
     {member scene id -> canonical scene id}. One comma-separated line per scene, the
@@ -81,18 +108,8 @@ def load_scene_groups(path: Path) -> dict[str, str]:
     either silently would put it in a split its group-mates are not in.
     """
     canonical_by_member: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        # Comma-separated, not whitespace: Explorer's bulk-rename numbering
-        # puts a space inside the filename ("scene008 (2).jpg"), so splitting
-        # on whitespace invents a bogus "(2)" scene. Caught by a test.
-        members = [
-            scene_id_from_basename(part.strip())
-            for part in stripped.split(",")
-            if part.strip()
-        ]
+    for raw_members in parse_groups_file(path):
+        members = [scene_id_from_basename(m) for m in raw_members]
         for member in members:
             if member in canonical_by_member and canonical_by_member[member] != members[0]:
                 raise ValueError(

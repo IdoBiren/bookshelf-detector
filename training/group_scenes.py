@@ -41,6 +41,8 @@ from pathlib import Path
 
 from PIL import Image, ExifTags
 
+from convert_labelstudio_export import parse_groups_file
+
 _DATETIME_ORIGINAL = {v: k for k, v in ExifTags.TAGS.items()}["DateTimeOriginal"]
 _EXIF_IFD = 0x8769
 
@@ -76,6 +78,60 @@ def group_by_time_gap(
         groups[-1].append(path)
         previous = taken
     return groups
+
+
+def assert_safe_to_write(out_path: Path, force: bool) -> None:
+    """Refuses to clobber an existing grouping file.
+
+    The proposal this script writes is explicitly "a starting point, NOT a
+    verdict". Once a human has made the verdict, an accidental re-run must not
+    silently replace it: on this dataset the automatic proposal produced 26
+    scenes and the hand review produced 58, so the overwrite would substitute
+    groupings already known to be wrong for ones that were checked by eye.
+    """
+    if out_path.exists() and not force:
+        raise SystemExit(
+            f"Refusing to overwrite {out_path} — it may contain hand-reviewed groupings.\n"
+            f"Pass --force to replace it, or --from-groups {out_path} to render contact "
+            f"sheets from it without touching it."
+        )
+
+
+def groups_from_file(
+    groups_file: Path, photos_dir: Path
+) -> tuple[list[list[Path]], list[str]]:
+    """Resolves an existing grouping file into photo paths, for rendering
+    contact sheets of a grouping a human already settled on.
+
+    Two behaviours that mirror convert_labelstudio_export.py so the sheets show
+    what the converter will actually do:
+      - a photo the file never mentions is its own scene (an ungrouped photo
+        is an independent scene, not an error),
+      - a scene id with no photo on disk is returned as `missing` rather than
+        raising, because quarantining a blurry photo legitimately leaves its
+        id behind in the file.
+    """
+    groups: list[list[Path]] = []
+    missing: list[str] = []
+    seen: set[str] = set()
+
+    for members in parse_groups_file(groups_file):
+        resolved = []
+        for stem in members:
+            seen.add(stem)
+            path = photos_dir / f"{stem}.jpg"
+            if path.exists():
+                resolved.append(path)
+            else:
+                missing.append(stem)
+        if resolved:
+            groups.append(resolved)
+
+    for path in sorted(photos_dir.glob("*.jpg")):
+        if path.stem not in seen:
+            groups.append([path])
+
+    return groups, missing
 
 
 def write_groups_file(groups: list[list[Path]], out_path: Path, gap_seconds: float) -> None:
@@ -150,11 +206,49 @@ def main() -> None:
         help="A gap larger than this between consecutive shots starts a new scene (default: 5).",
     )
     parser.add_argument("--no-sheets", action="store_true", help="Write the groups file only.")
+    parser.add_argument(
+        "--from-groups",
+        type=Path,
+        default=None,
+        help="Render contact sheets from an EXISTING grouping file instead of proposing a new "
+        "one from EXIF. Use this to look at a grouping that was reviewed by hand — it never "
+        "writes to the grouping file.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwriting an existing --out-file. Without it, an existing file is left "
+        "alone, because it may hold hand-reviewed groupings.",
+    )
     args = parser.parse_args()
 
-    photos = sorted(args.photos_dir.resolve().glob("*.jpg"))
+    photos_dir = args.photos_dir.resolve()
+
+    if args.from_groups:
+        groups, missing = groups_from_file(args.from_groups.resolve(), photos_dir)
+        if missing:
+            # Loud, not silent: these are usually photos moved to a quarantine
+            # folder whose ids were never swept out of the grouping file.
+            print(f"NOTE: {len(missing)} scene id(s) in the file have no photo in {photos_dir}:")
+            for stem in missing[:10]:
+                print(f"  {stem}")
+            if len(missing) > 10:
+                print(f"  ... and {len(missing) - 10} more")
+        sizes = [len(g) for g in groups]
+        print(f"Scenes from {args.from_groups}: {len(groups)}")
+        print(f"Photos per scene: min={min(sizes)} max={max(sizes)} mean={sum(sizes)/len(sizes):.1f}")
+        if not args.no_sheets:
+            sheets_dir = args.sheets_dir.resolve()
+            for group in groups:
+                render_contact_sheet(group, sheets_dir / f"{group[0].stem}.jpg")
+            print(f"Wrote {len(groups)} contact sheets to {sheets_dir}")
+        return
+
+    photos = sorted(photos_dir.glob("*.jpg"))
     if not photos:
         raise SystemExit(f"No .jpg files in {args.photos_dir}")
+
+    assert_safe_to_write(args.out_file.resolve(), args.force)
 
     timed, undated = [], []
     for path in photos:

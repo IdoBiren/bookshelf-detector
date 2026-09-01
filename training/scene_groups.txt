@@ -8,29 +8,74 @@
 # merging too little puts near-duplicate shots on both sides of the
 # split, which silently inflates every validation number.
 
-scene001, scene002
-scene003, scene004, scene005, scene006
-scene007, scene008, scene009, scene010, scene011, scene012, scene013, scene014, scene015, scene016, scene017
-scene018, scene019, scene020
-scene021, scene022, scene023, scene024, scene025, scene026, scene027
+# --- scene001-034: hand-reviewed by the user directly against the photos,
+# strict "any overlapping book -> merge" rule. This supersedes the automatic
+# proposal for this range. scene032 excluded (see photos_excluded/).
+scene001, scene002, scene003, scene012, scene013, scene014, scene015
+scene004, scene005, scene006, scene009, scene010, scene011, scene016, scene017
+scene007
+scene008
+scene018
+scene019
+scene020
+scene021
+scene022
+scene023
+scene024
+scene025
+scene026
+scene027
 scene028
-scene029, scene030
-scene031
-scene032
-scene033, scene034
-scene035
-scene036, scene037, scene038, scene039, scene040, scene041, scene042, scene043, scene044, scene045, scene046, scene047, scene048, scene049, scene050, scene051, scene052, scene053
-scene054, scene055, scene056, scene057
-scene058
-scene059, scene060, scene061, scene062, scene063, scene064, scene065, scene066, scene067, scene068, scene069, scene070, scene071, scene072, scene073, scene074, scene075, scene076, scene077
+scene029, scene030, scene031
+scene033
+scene034
+# --- scene036-064: hand-reviewed (scene065+ below is still the automatic
+# proposal, not yet checked). scene060/062/064 flagged blurry and excluded
+# (see photos_blurry/).
+scene036, scene037, scene038, scene039, scene040, scene054, scene055
+scene041, scene042, scene043, scene044, scene057, scene056
+scene045, scene046, scene047, scene048
+scene049, scene050, scene051, scene052, scene053
+scene059
+scene061
+scene063
+# --- scene065-097: hand-reviewed. scene066-073/084/086-088/090/091/094/096/097
+# and the whole scene098-126 range flagged blurry and excluded (see
+# photos_blurry/). scene077/080/082/092/093 turned out to already be excluded
+# too -- they were part of the original 20-photo automatic blur quarantine
+# from the very start of this session (before hand-review began), just never
+# swept out of this file until now. Same story for scene127/137/138 below.
+scene065
+scene074, scene076
+scene075
 scene078
-scene079, scene080
+scene079
 scene081
-scene082
-scene083, scene084, scene085, scene086, scene087, scene088, scene089, scene090, scene091, scene092, scene093, scene094, scene095, scene096, scene097, scene098, scene099, scene100, scene101, scene102, scene103, scene104, scene105, scene106, scene107, scene108, scene109, scene110, scene111, scene112, scene113, scene114, scene115, scene116, scene117, scene118, scene119, scene120, scene121, scene122, scene123, scene124, scene125
-scene126, scene127, scene128
-scene129, scene130, scene131, scene132, scene133, scene134, scene135, scene136, scene137, scene138
-scene139, scene140, scene141
-scene142
-scene143
-scene144, scene145, scene146, scene147, scene148, scene149, scene150, scene151, scene152, scene153, scene154, scene155, scene156, scene157, scene158, scene159, scene160, scene161, scene162, scene163, scene164, scene165
+scene083
+scene085
+scene089
+scene095
+# --- scene128-165 (+ scene166-169, the new batch): hand-reviewed, this
+# range completes the full manual pass. scene133/142/143/146/147/148/150/160
+# flagged blurry and excluded (see photos_blurry/). scene139 was NOT
+# mentioned in the review batch -- defaulted to independent, flagged back
+# to the user.
+scene128
+scene129, scene130, scene141
+scene131, scene132, scene140
+scene134, scene135
+scene136
+scene139
+scene144, scene145, scene161
+scene149, scene163
+scene151
+scene152
+scene153, scene154
+scene155
+scene156
+scene157
+scene158
+scene159
+scene162
+scene164
+scene165
