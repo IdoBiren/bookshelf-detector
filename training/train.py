@@ -29,10 +29,27 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import time
 from pathlib import Path
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError as error:  # pragma: no cover - environment guard
+    # torch lives in training/.venv, NOT in the system Python (which is 3.14
+    # and also runs Label Studio -- the two were deliberately kept apart, see
+    # HANDOFF.md). Running `python training/train.py` with the system
+    # interpreter otherwise dies on a bare ModuleNotFoundError that says
+    # nothing about which interpreter to use.
+    raise SystemExit(
+        f"{error}\n\n"
+        "torch is installed in training/.venv, not in this interpreter\n"
+        f"  (currently running: {sys.executable})\n\n"
+        "Use the venv's Python instead:\n"
+        "  training/.venv/Scripts/python.exe training/train.py --limit 20 --epochs 30\n\n"
+        "In Colab this does not apply -- torch is already present, so plain\n"
+        "`python training/train.py ...` is correct there."
+    ) from error
 
 from dataset import SpineDataset, collate_fn
 from model import build_model, describe_model

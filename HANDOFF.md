@@ -73,8 +73,27 @@ proceeding. Stage 7's calibration is no longer a blind sweep — the
 **Tests, both green as of this handoff:**
 ```bash
 npx vitest run                                         # 34/34 (browser/TS)
-cd training && python -m unittest discover -s tests    # 112/112 (pipeline/Python)
+cd training && python -m unittest discover -s tests    # 166/166 (pipeline/Python)
 ```
+
+### ⚠️ Two Pythons on this machine — pick the right one
+
+- **System Python 3.14** runs Label Studio and the stdlib-only data
+  pipeline. It has no `torch`.
+- **`training/.venv`** has torch/torchvision/onnx/onnxruntime. Everything
+  that touches the model needs it:
+
+```bash
+training/.venv/Scripts/python.exe training/train.py --limit 20 --epochs 30
+training/.venv/Scripts/python.exe training/evaluate.py --checkpoint <path>
+```
+
+They were split deliberately, to keep torch away from the working
+label-studio install. `train.py` and `evaluate.py` now fail with an
+explicit message naming the right interpreter rather than a bare
+`ModuleNotFoundError: No module named 'torch'`, which is what actually
+happened the first time. **In Colab none of this applies** — torch is
+already there, so plain `python training/train.py ...` is correct.
 
 ### Data on disk (all gitignored — never commit)
 

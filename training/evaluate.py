@@ -23,6 +23,7 @@ exists for: is the task learnable at all?
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -223,8 +224,24 @@ def evaluate_checkpoint(
     """Loads a trained checkpoint, runs it over a COCO split, and returns
     §8א's numbers. Ground truth quads come from the SAME mask_to_quad path
     the predictions do, so the comparison isn't confounded by two different
-    polygon-fitting routes."""
-    import torch
+    polygon-fitting routes.
+
+    torch is imported lazily here on purpose: every metric function above is
+    torch-free and works on plain quads, so all of §8א stays unit-testable
+    without an ML stack. Only this function needs the model."""
+    try:
+        import torch
+    except ModuleNotFoundError as error:  # pragma: no cover - environment guard
+        # Same trap as train.py: torch is in training/.venv, not in the
+        # system Python that also runs Label Studio.
+        raise SystemExit(
+            f"{error}\n\n"
+            "torch is installed in training/.venv, not in this interpreter\n"
+            f"  (currently running: {sys.executable})\n\n"
+            "Use the venv's Python instead:\n"
+            "  training/.venv/Scripts/python.exe training/evaluate.py --checkpoint <path>\n\n"
+            "In Colab this does not apply -- plain `python` is correct there."
+        ) from error
 
     from dataset import SpineDataset
     from mask_to_quad import mask_to_quad
