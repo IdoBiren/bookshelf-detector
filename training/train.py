@@ -146,6 +146,7 @@ def main(
     learning_rate: float = 0.005,
     limit: int | None = None,
     num_workers: int = 2,
+    log_every: int = 20,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
@@ -155,6 +156,11 @@ def main(
         # Stage 5's overfit check (plan §9): a handful of images, loss -> ~0.
         dataset.entries = dataset.entries[:limit]
     print(f"dataset: {len(dataset)} images  stats={dataset.stats}")
+    batches_per_epoch = (len(dataset) + batch_size - 1) // batch_size
+    # Printed so a quiet stretch is readable as "still working" rather
+    # than "hung" -- with 720 batches and log_every=20 there are ~36
+    # lines per epoch, i.e. tens of seconds of silence between them.
+    print(f"batches/epoch: {batches_per_epoch}  (a log line every {log_every} batches)")
 
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -182,7 +188,7 @@ def main(
     for epoch in range(start_epoch, epochs):
         started = time.time()
         print(f"\n=== epoch {epoch}/{epochs - 1} ===", flush=True)
-        mean_loss = train_one_epoch(model, optimizer, loader, device)
+        mean_loss = train_one_epoch(model, optimizer, loader, device, log_every)
         elapsed = time.time() - started
 
         history.append({"epoch": epoch, "mean_loss": mean_loss, "seconds": elapsed})
@@ -204,7 +210,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=0.005)
     parser.add_argument("--limit", type=int, default=None, help="Stage 5 overfit check: use only N images.")
-    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=2,
+                        help="0 is the safe value if the loader appears to hang (notebook "
+                             "multiprocessing is the usual cause).")
+    parser.add_argument("--log-every", type=int, default=20,
+                        help="Batches between progress lines. Lower it to tell a slow "
+                             "epoch apart from a hang.")
     args = parser.parse_args()
 
     main(
@@ -216,4 +227,5 @@ if __name__ == "__main__":
         learning_rate=args.learning_rate,
         limit=args.limit,
         num_workers=args.num_workers,
+        log_every=args.log_every,
     )
