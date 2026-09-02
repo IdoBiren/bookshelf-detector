@@ -347,3 +347,25 @@ hard lighting, so it's **not** a product candidate. But it would give
   `data/raw/*/*`, `data/merged/`, and `data/indomain/`. **`data/indomain/`
   is photos of real homes — that rule was committed before any photo
   landed, and must stay.**
+
+### Uploading `data/indomain/` — decision, 2026-09-01
+
+An earlier note here said "never upload it anywhere". **The owner has since
+explicitly approved uploading these photos to Google (Drive/Colab)** for
+fine-tuning, so that blanket rule no longer holds and should not be treated
+as blocking. Two things it does NOT change:
+
+- **`.gitignore` stays exactly as it is.** "Don't commit" and "don't upload
+  to Drive" are separate rules; only the second was lifted. These photos
+  must still never enter git history, where they would be public and
+  permanent.
+- **`scene166`–`scene169` may not be the owner's own home.** They arrive
+  with no EXIF at 2048×1152 (vs 4080×3072 for the rest) — the signature of
+  an image that came through a messaging app, i.e. plausibly shot by
+  someone else and forwarded. Whoever took them has not been asked. Worth
+  raising again if the dataset grows by more third-party photos.
+
+For the quality-ceiling run this is moot: that measurement uses only the
+**public** Roboflow data (`data/merged/images/`, 141MB, 1604 files).
+`data/indomain/photos/` (332MB, 103 files) is needed for fine-tune and for
+the §8ב ship decision, not before.
