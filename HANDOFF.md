@@ -269,6 +269,49 @@ trivial model before betting days on the real one. Don't skip it.
 
 ---
 
+## Stage 5 (overfit check) — run, and what it found
+
+Ran 2026-09-01: 20 images from `pretrain_train`, 30 epochs, CPU, no
+augmentation. **Loss 3.67 → 0.638.** Evaluated back on those same 20 images
+(§9's actual requirement is "the model reproduces the labels of those 20",
+not merely "the loss went down"):
+
+```
+mAP@50 = 0.5642   mAP@50:95 = 0.3424
+thin AP@50=0.359 (n=96) · medium=0.324 (n=95) · wide=0.709 (n=96)
+```
+
+**The chain works.** Per-instance mask IoU against ground truth is
+**0.86–0.96**, and quad IoU tracks it within ~3% — so `mask_to_quad.py` is
+not where quality is lost, and train→checkpoint→inference→quads→mAP runs
+end to end.
+
+**The mAP gap is axis-aligned NMS suppressing adjacent spines.** The densest
+image (25 spines) returned only 12 detections at the default
+`box_nms_thresh=0.5`; raising it to 0.7 returned 29. The detections existed
+and were being discarded.
+
+This is §1's own argument surfacing somewhere new. §1 says a spine tilted
+15° has an AABB that is ~64% its neighbours' content — which is exactly why
+the *output* is a quad. But **torchvision's Mask R-CNN runs its NMS on
+axis-aligned boxes**, so for tightly-packed tilted spines it sees heavy box
+overlap between genuinely distinct books and suppresses the neighbour.
+
+Not a hard ceiling, and **not yet a verdict**:
+- `nms_thresh=0.7` recovers the missing ones but over-detects elsewhere
+  (14 GT → 28 predictions), so the threshold is a trade, not a fix.
+- The real fix if it persists is **mask-based NMS** — suppress on mask/quad
+  IoU rather than box IoU, the same substitution `evaluate.py` already
+  makes for its metrics.
+- A model trained for 30 epochs on 20 CPU images produces sloppy boxes, and
+  sloppy boxes make NMS behave worse than it will after real training. Check
+  whether this survives the full Colab run before building anything.
+
+Width breakdown is consistent with the same cause: thin and medium spines
+pack closer together than wide ones, so they lose more to NMS.
+
+---
+
 ## Open questions for whoever picks this up
 
 1. ~~**`shrink_ratio` / `unclip_ratio` are tuned for text lines, not books**~~
