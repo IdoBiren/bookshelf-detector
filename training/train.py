@@ -122,11 +122,17 @@ def train_one_epoch(model, optimizer, loader, device, log_every: int = 20) -> fl
         total.backward()
         optimizer.step()
 
-        running_loss += float(total)
+        # detach() before reading any of these as plain numbers. Without it
+        # torch warns on every batch ("Converting a tensor with
+        # requires_grad=True to a scalar"), and holding a grad-tracking
+        # tensor in a running total would keep its graph alive for the whole
+        # epoch. Safe here because backward() has already run.
+        total_value = float(total.detach())
+        running_loss += total_value
         batches += 1
         if index % log_every == 0:
-            parts = "  ".join(f"{k}={float(v):.3f}" for k, v in losses.items())
-            print(f"  batch {index:>5}  total={float(total):.4f}  {parts}", flush=True)
+            parts = "  ".join(f"{k}={float(v.detach()):.3f}" for k, v in losses.items())
+            print(f"  batch {index:>5}  total={total_value:.4f}  {parts}", flush=True)
 
     return running_loss / max(batches, 1)
 
