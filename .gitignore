@@ -9,12 +9,17 @@ data/raw/*/*
 !data/raw/*/.gitkeep
 
 # Merged/derived dataset: regenerable from data/raw/ via merge_datasets.py,
-# 94MB of copied images — don't commit build output.
-data/merged/
+# 94MB of copied images — don't commit build output. Contents excluded
+# rather than the directory itself, so the .gitkeep below survives and a
+# fresh clone actually HAS the directory (see below).
+data/merged/*
+!data/merged/.gitkeep
 
 # Your own home photos + labels (plan §3). Never commit these — real
-# photos of real homes, unlike the public data above.
-data/indomain/
+# photos of real homes, unlike the public data above. Only the bare
+# .gitkeep is re-included; photos/ stays fully excluded.
+data/indomain/*
+!data/indomain/.gitkeep
 
 # Phase A training env (torch/onnx) — kept out of the working label-studio install.
 training/.venv/
