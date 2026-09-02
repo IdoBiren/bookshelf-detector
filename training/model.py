@@ -1,0 +1,97 @@
+"""
+Mask R-CNN for book-spine instance segmentation.
+
+Why this and not the DBNet-lite of plan §1: DBNet's shrink-mask machinery
+existed for exactly one reason — to separate touching instances inside a
+~2.5M parameter budget. Mask R-CNN produces one mask per RoI, so touching
+spines are separate by construction: no shrink map, no unclip, and none of
+the tapering-quad self-intersection phase B measured (HANDOFF.md "Open
+questions" §1). The size budget is suspended while the quality ceiling is
+being measured, which is what makes this affordable.
+
+`torchvision` is BSD-3-Clause (plan §0 already approved it as a source, and
+§1 already accepted its ImageNet-pretrained weights for the MobileNetV3
+backbone). Note for the record: the COCO-pretrained detection weights carry
+no explicit `license` field in torchvision's own metadata — they are
+produced by torchvision's training recipe and distributed with the library.
+That is the same level of certainty §1's ImageNet weights have, not a new
+exposure, but it is not a formal grant either.
+
+The notebook stays thin (plan §13 phase D): clone -> pip install -> call
+into this module. No model development inside a notebook cell.
+"""
+
+from __future__ import annotations
+
+import torch
+import torchvision
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+
+# Background + spine. One real class on purpose (plan §3): a `non_book`
+# class only gets added if evaluation shows false positives are an actual
+# problem, and torchvision counts background as class 0.
+NUM_CLASSES = 2
+SPINE_LABEL = 1
+
+DEFAULT_HIDDEN_LAYER = 256  # torchvision's own default for the mask head
+
+
+def build_model(pretrained: bool = True, trainable_backbone_layers: int | None = None):
+    """Mask R-CNN ResNet50-FPN with both predictor heads resized to
+    NUM_CLASSES.
+
+    `pretrained=False` is for tests — it keeps them offline and fast. Real
+    training wants the COCO weights: 1,440 pretrain images is far too few to
+    learn detection from scratch, and the whole point of this phase is to
+    measure the ceiling, not to handicap it.
+
+    Both heads must be replaced. Swapping only the box predictor leaves the
+    mask head predicting COCO's 91 classes — the model still trains, and the
+    bug is invisible until the masks come out wrong. There's a test for it.
+    """
+    # weights_backbone must be pinned off too. torchvision defaults it to
+    # ImageNet weights independently of `weights`, so `weights=None` alone
+    # still triggers a ~100MB ResNet50 download -- which quietly made the
+    # "offline" tests not offline until this was caught.
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn(
+        weights="DEFAULT" if pretrained else None,
+        weights_backbone="DEFAULT" if pretrained else None,
+        trainable_backbone_layers=trainable_backbone_layers,
+    )
+
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, NUM_CLASSES)
+
+    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+    model.roi_heads.mask_predictor = MaskRCNNPredictor(
+        in_features_mask, DEFAULT_HIDDEN_LAYER, NUM_CLASSES
+    )
+
+    return model
+
+
+def describe_model(model: torch.nn.Module) -> dict:
+    """Parameter count and fp32 footprint, for the record.
+
+    Reported, not asserted: the size budget is deliberately suspended for
+    this phase (see the module docstring). Keeping the number visible means
+    the later "how much do we lose going small?" decision starts from a
+    measured baseline instead of an estimate.
+    """
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return {
+        "total_params": total,
+        "trainable_params": trainable,
+        "size_mb_fp32": total * 4 / (1024 * 1024),
+    }
+
+
+if __name__ == "__main__":
+    model = build_model(pretrained=False)
+    info = describe_model(model)
+    print(f"classes:          {NUM_CLASSES} (background + spine)")
+    print(f"total params:     {info['total_params']:,}")
+    print(f"trainable params: {info['trainable_params']:,}")
+    print(f"fp32 size:        {info['size_mb_fp32']:.1f} MB")
