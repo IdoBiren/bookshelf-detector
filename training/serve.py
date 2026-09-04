@@ -68,6 +68,40 @@ CROP_JPEG_QUALITY = int(os.environ.get("CROP_JPEG_QUALITY", 90))
 # nothing useful and the cause would have looked like a model problem.
 DEFAULT_FLIP = os.environ.get("DEFAULT_FLIP", "true").lower() != "false"
 
+def _require_checkpoint() -> None:
+    """Fail loudly and legibly when the checkpoint file is missing.
+
+    Deliberately at IMPORT time rather than in the startup handler. Raising
+    from the handler does print the reason, but starlette then stacks
+    fifteen lines of traceback on top of it and ends with "Application
+    startup failed. Exiting." -- so the only line still on screen says
+    nothing about the cause. A missing or mistyped checkpoint path is by far
+    the most likely thing to go wrong when starting this, so it gets the
+    clearest failure available: the message, and nothing after it."""
+    if Path(CHECKPOINT).is_file():
+        return
+
+    example = '$env:CHECKPOINT="C:' + chr(92) + 'Downloads' + chr(92) + 'checkpoint_epoch_004.pt"'
+    raise SystemExit(
+        "\n"
+        + "=" * 68
+        + "\n  CANNOT START: no checkpoint file at"
+        + f"\n    {Path(CHECKPOINT).resolve()}"
+        + "\n"
+        + "\n  Point CHECKPOINT at a real .pt file. In PowerShell:"
+        + f"\n    {example}"
+        + "\n"
+        + "\n  That path is an EXAMPLE -- use wherever the file actually is on"
+        + "\n  this machine. If it has not been downloaded from Drive yet,"
+        + "\n  that is the missing step."
+        + "\n"
+        + "=" * 68
+        + "\n"
+    )
+
+
+_require_checkpoint()
+
 app = FastAPI(title="bookshelf-detector")
 
 app.add_middleware(
