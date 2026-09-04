@@ -19,7 +19,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from evaluate import (  # noqa: E402
+    _summarize_stage_recall,
     average_precision,
+    box_recall,
     evaluate,
     iou_matrix,
     match_predictions,
@@ -310,6 +312,98 @@ class TestIouMatrixCache(unittest.TestCase):
         self.assertEqual(iou_matrix([], gt).shape, (0, 1))
         self.assertEqual(iou_matrix([(gt[0], 1.0)], []).shape, (1, 0))
         self.assertEqual(iou_matrix([], []).shape, (0, 0))
+
+
+class TestBoxRecall(unittest.TestCase):
+    """Axis-aligned recall, deliberately separate from quad_iou. It exists to
+    be compared AGAINST the quad-based recall/AP above: the gap between them
+    on the same detections is the pipeline-stage diagnostic (does a box-level
+    hit survive becoming a quad)."""
+
+    def test_perfect_boxes_recall_everything(self):
+        gt = [[0, 0, 10, 100], [20, 0, 50, 100], [60, 0, 110, 100]]
+        self.assertAlmostEqual(box_recall(gt, gt), 1.0, places=6)
+
+    def test_half_detected_gives_half_recall(self):
+        found = [0, 0, 30, 100]
+        missed = [60, 0, 90, 100]
+        self.assertAlmostEqual(box_recall([found], [found, missed]), 0.5, places=6)
+
+    def test_no_predictions_gives_zero_and_does_not_crash(self):
+        self.assertAlmostEqual(box_recall([], [[0, 0, 30, 100]]), 0.0, places=6)
+
+    def test_no_ground_truth_gives_zero_without_dividing_by_zero(self):
+        self.assertAlmostEqual(box_recall([[0, 0, 30, 100]], []), 0.0, places=6)
+        self.assertAlmostEqual(box_recall([], []), 0.0, places=6)
+
+    def test_duplicate_detections_do_not_push_recall_past_one(self):
+        box = [0, 0, 30, 100]
+        self.assertAlmostEqual(box_recall([box, box, box], [box]), 1.0, places=6)
+
+    def test_a_rotated_spines_aabb_can_hit_where_its_quad_misses(self):
+        """This is the exact discrepancy --stage-recall exists to expose,
+        shrunk to one shape: a box detection can look like a hit at the AABB
+        level and a miss at the quad level. box_recall must report the
+        former; quad_iou (already tested above) reports the latter."""
+        # A spine tilted enough that its AABB is much larger than its body --
+        # section 1's own argument for why AABB IoU is the wrong metric.
+        gt_quad = [(40, 0), (60, 0), (20, 100), (0, 100)]
+        gt_box = [0, 0, 60, 100]
+        pred_box = [0, 0, 60, 100]  # exact AABB match
+        pred_quad = [(0, 0), (60, 0), (60, 100), (0, 100)]  # the untilted box as a quad
+
+        self.assertAlmostEqual(box_recall([pred_box], [gt_box]), 1.0, places=6)
+        self.assertLess(quad_iou(pred_quad, gt_quad), 0.5)
+
+
+class TestSummarizeStageRecall(unittest.TestCase):
+    """`--stage-recall`'s whole point is telling a proposal-stage loss apart
+    from a box-stage loss, per width band. stage_data is [(gt_boxes,
+    gt_widths, proposal_boxes, detection_boxes), ...] per image, all plain
+    lists (already off any GPU/tensor by the time this runs)."""
+
+    def test_perfect_at_every_stage_gives_recall_one_everywhere(self):
+        gt = [[0, 0, 10, 100], [30, 0, 40, 100]]
+        widths = [10.0, 10.0]
+        summary = _summarize_stage_recall([(gt, widths, gt, gt)])
+        self.assertAlmostEqual(summary["overall"]["proposals"], 1.0)
+        self.assertAlmostEqual(summary["overall"]["detections_box"], 1.0)
+
+    def test_missing_at_proposal_stage_never_recovers_downstream(self):
+        """A spine the RPN never proposed cannot appear in detections either
+        -- this pins that a proposal-stage miss and a detection-stage miss
+        are counted independently, not as one shared flag."""
+        gt = [[0, 0, 10, 100]]
+        widths = [10.0]
+        summary = _summarize_stage_recall([(gt, widths, [], [])])
+        self.assertAlmostEqual(summary["overall"]["proposals"], 0.0)
+        self.assertAlmostEqual(summary["overall"]["detections_box"], 0.0)
+
+    def test_narrows_a_loss_to_the_detection_stage_specifically(self):
+        """Proposals find it, the final detection box does not -- the
+        signature stage-recall exists to surface, and the whole reason
+        `detections_box` is tracked as a SEPARATE key from `proposals`."""
+        gt = [[0, 0, 10, 100]]
+        widths = [10.0]
+        summary = _summarize_stage_recall([(gt, widths, gt, [])])
+        self.assertAlmostEqual(summary["overall"]["proposals"], 1.0)
+        self.assertAlmostEqual(summary["overall"]["detections_box"], 0.0)
+
+    def test_bands_partition_the_same_spines_counted_overall(self):
+        thin, medium, wide = [0, 0, 5, 100], [20, 0, 40, 100], [60, 0, 120, 100]
+        gt = [thin, medium, wide]
+        widths = [5.0, 20.0, 60.0]
+        summary = _summarize_stage_recall([(gt, widths, gt, gt)])
+        self.assertEqual(
+            summary["thin"]["n"] + summary["medium"]["n"] + summary["wide"]["n"],
+            summary["overall"]["n"],
+        )
+        self.assertEqual(summary["overall"]["n"], 3)
+
+    def test_empty_stage_data_does_not_crash(self):
+        summary = _summarize_stage_recall([])
+        self.assertEqual(summary["overall"]["n"], 0)
+        self.assertAlmostEqual(summary["overall"]["proposals"], 0.0)
 
 
 if __name__ == "__main__":

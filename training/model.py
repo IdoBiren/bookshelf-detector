@@ -37,7 +37,11 @@ SPINE_LABEL = 1
 DEFAULT_HIDDEN_LAYER = 256  # torchvision's own default for the mask head
 
 
-def build_model(pretrained: bool = True, trainable_backbone_layers: int | None = None):
+def build_model(
+    pretrained: bool = True,
+    trainable_backbone_layers: int | None = None,
+    nms_thresh: float | None = 0.6,
+):
     """Mask R-CNN ResNet50-FPN with both predictor heads resized to
     NUM_CLASSES.
 
@@ -49,7 +53,15 @@ def build_model(pretrained: bool = True, trainable_backbone_layers: int | None =
     Both heads must be replaced. Swapping only the box predictor leaves the
     mask head predicting COCO's 91 classes — the model still trains, and the
     bug is invisible until the masks come out wrong. There's a test for it.
-    """
+
+    `nms_thresh` overrides `roi_heads.nms_thresh` (torchvision's raw default
+    is 0.5) and defaults to **0.6**, not to torchvision's own default: 0.6
+    measured +1.0pp mAP@50 and +3.1pp recall@50 on pretrain_val over 0.5, at
+    no retraining cost, because NMS is a post-processing step, applied only
+    when the model is in eval() mode. 0.7 was also measured and rejected --
+    recall kept climbing but the precision cost overtook it, netting a lower
+    mAP than 0.6. Pass `nms_thresh=None` for torchvision's untouched 0.5,
+    e.g. to reproduce the pre-measurement baseline."""
     # weights_backbone must be pinned off too. torchvision defaults it to
     # ImageNet weights independently of `weights`, so `weights=None` alone
     # still triggers a ~100MB ResNet50 download -- which quietly made the
@@ -68,6 +80,9 @@ def build_model(pretrained: bool = True, trainable_backbone_layers: int | None =
         in_features_mask, DEFAULT_HIDDEN_LAYER, NUM_CLASSES
     )
 
+    if nms_thresh is not None:
+        set_detection_thresholds(model, nms_thresh=nms_thresh)
+
     return model
 
 
@@ -76,17 +91,26 @@ def set_detection_thresholds(
     nms_thresh: float | None = None,
     score_thresh: float | None = None,
     detections_per_img: int | None = None,
+    rpn_nms_thresh: float | None = None,
 ) -> dict:
-    """Override the detection head's post-processing thresholds on a model
-    that is already built. Returns only what it changed, so a caller can
-    print it and have the run's output record its own configuration.
+    """Override post-processing thresholds on a model that is already built.
+    Returns only what it changed, so a caller can print it and have the
+    run's output record its own configuration.
 
     `build_model` sets none of these, so torchvision's defaults apply:
-    nms_thresh=0.5, score_thresh=0.05, detections_per_img=100.
+    roi_heads.nms_thresh=0.5, roi_heads.score_thresh=0.05,
+    roi_heads.detections_per_img=100, rpn.nms_thresh=0.7.
 
-    Exists as a tested function because the names do not match and the
-    mismatch fails silently. The MaskRCNN CONSTRUCTOR takes
-    `box_nms_thresh`; RoIHeads STORES it as `nms_thresh`. Assigning
+    `rpn_nms_thresh` is a SEPARATE, upstream stage from `nms_thresh`: the RPN
+    suppresses region proposals before the detection head ever sees them,
+    while `nms_thresh` suppresses the head's final boxes. Sweeping one tells
+    you nothing about the other -- keep them as distinct attributes on
+    distinct modules (`model.rpn` vs `model.roi_heads`) rather than
+    collapsing them into one name.
+
+    Exists as a tested function because the names do not match the
+    constructor and the mismatch fails silently. The MaskRCNN CONSTRUCTOR
+    takes `box_nms_thresh`; RoIHeads STORES it as `nms_thresh`. Assigning
     `roi_heads.box_nms_thresh = 0.7` raises nothing, changes nothing, and an
     NMS sweep built that way comes back flat -- which reads exactly like
     "NMS is not the bottleneck" and would retire a live hypothesis on a
@@ -109,6 +133,14 @@ def set_detection_thresholds(
             )
         setattr(model.roi_heads, name, float(value))
         changed[name] = float(value)
+
+    if rpn_nms_thresh is not None:
+        if not 0.0 <= float(rpn_nms_thresh) <= 1.0:
+            raise ValueError(
+                f"rpn_nms_thresh must be in [0.0, 1.0], got {rpn_nms_thresh!r}"
+            )
+        model.rpn.nms_thresh = float(rpn_nms_thresh)
+        changed["rpn_nms_thresh"] = float(rpn_nms_thresh)
 
     if detections_per_img is not None:
         if int(detections_per_img) < 1:

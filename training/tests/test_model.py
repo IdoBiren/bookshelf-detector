@@ -73,6 +73,20 @@ class TestBuildModel(unittest.TestCase):
         if masks.shape[0] > 0:
             self.assertEqual(masks.shape[1], 1)
 
+    def test_defaults_to_the_measured_nms_thresh(self):
+        """0.6 measured +1.0pp mAP@50 and +3.1pp recall@50 over torchvision's
+        raw 0.5, at no retraining cost -- so it is the default rather than
+        something every caller has to remember to pass. 0.7 was also
+        measured and rejected: recall kept rising but precision loss caught
+        up, netting a LOWER mAP than 0.6."""
+        self.assertAlmostEqual(self.model.roi_heads.nms_thresh, 0.6)
+
+    def test_nms_thresh_none_keeps_torchvisions_raw_default(self):
+        """The escape hatch a sweep needs: comparing against the untouched
+        baseline requires being able to ask for it."""
+        raw = build_model(pretrained=False, nms_thresh=None)
+        self.assertAlmostEqual(raw.roi_heads.nms_thresh, 0.5)
+
     def test_train_mode_returns_the_four_loss_terms_the_loop_will_sum(self):
         self.model.train()
         image = torch.rand(3, 256, 256)
@@ -111,16 +125,43 @@ class TestSetDetectionThresholds(unittest.TestCase):
     rather than two lines in evaluate.py."""
 
     def setUp(self):
-        self.model = build_model(pretrained=False)
+        # nms_thresh=None: these tests are about the setter itself, not
+        # build_model's baked-in 0.6 -- starting from torchvision's raw
+        # defaults keeps "untouched" assertions meaningful.
+        self.model = build_model(pretrained=False, nms_thresh=None)
 
     def test_torchvision_defaults_are_what_we_think_they_are(self):
         """Pinned because the whole recall investigation is reasoned against
-        these three numbers. If a torchvision upgrade moves them, the
-        measured history stops being comparable and we want to be told."""
-        heads = self.model.roi_heads
+        these numbers. If a torchvision upgrade moves them, the measured
+        history stops being comparable and we want to be told.
+
+        Built with nms_thresh=None here specifically -- build_model's OWN
+        default is no longer torchvision's raw 0.5, see
+        TestBuildModel.test_defaults_to_the_measured_nms_thresh below."""
+        raw = build_model(pretrained=False, nms_thresh=None)
+        heads = raw.roi_heads
         self.assertAlmostEqual(heads.nms_thresh, 0.5)
         self.assertAlmostEqual(heads.score_thresh, 0.05)
         self.assertEqual(heads.detections_per_img, 100)
+        self.assertAlmostEqual(raw.rpn.nms_thresh, 0.7)
+
+    def test_sets_rpn_nms_thresh_not_roi_heads_nms_thresh(self):
+        """rpn.nms_thresh suppresses PROPOSALS, upstream of roi_heads.nms_thresh
+        which suppresses final detections. They are two separate stages, and
+        this test exists so a future refactor cannot quietly collapse them
+        into one attribute -- that would make an RPN-stage sweep silently
+        change detection-stage behaviour instead, or vice versa."""
+        set_detection_thresholds(self.model, rpn_nms_thresh=0.8)
+        self.assertAlmostEqual(self.model.rpn.nms_thresh, 0.8)
+        self.assertAlmostEqual(self.model.roi_heads.nms_thresh, 0.5)  # untouched
+
+    def test_rejects_rpn_nms_thresh_outside_zero_to_one(self):
+        with self.assertRaises(ValueError):
+            set_detection_thresholds(self.model, rpn_nms_thresh=7)
+
+    def test_rpn_nms_thresh_is_reported_in_the_changed_dict(self):
+        changed = set_detection_thresholds(self.model, rpn_nms_thresh=0.8)
+        self.assertEqual(changed, {"rpn_nms_thresh": 0.8})
 
     def test_sets_the_attribute_inference_actually_reads(self):
         set_detection_thresholds(self.model, nms_thresh=0.7)

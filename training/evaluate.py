@@ -84,6 +84,42 @@ def iou_matrix(
     return matrix
 
 
+def box_recall(pred_boxes, gt_boxes, threshold: float = 0.5) -> float:
+    """Axis-aligned IoU recall: the fraction of `gt_boxes` with at least one
+    box in `pred_boxes` at or above `threshold`. Each box is [x0, y0, x1, y1].
+
+    Deliberately axis-aligned rather than quad_iou -- this exists to be
+    compared AGAINST the quad-based recall computed elsewhere in this module.
+    The gap between the two on the SAME detections is the pipeline-stage
+    diagnostic: a box can be a hit here and a miss on quad_iou for a rotated
+    spine, which is section 1's own argument for why AABB IoU is the wrong
+    metric, surfacing again as a debugging tool rather than a scoring flaw."""
+    gt_boxes = np.asarray(gt_boxes, dtype=np.float64).reshape(-1, 4)
+    pred_boxes = np.asarray(pred_boxes, dtype=np.float64).reshape(-1, 4)
+    if len(gt_boxes) == 0:
+        return 0.0
+    if len(pred_boxes) == 0:
+        return 0.0
+
+    hits = 0
+    for gx0, gy0, gx1, gy1 in gt_boxes:
+        ix0 = np.maximum(pred_boxes[:, 0], gx0)
+        iy0 = np.maximum(pred_boxes[:, 1], gy0)
+        ix1 = np.minimum(pred_boxes[:, 2], gx1)
+        iy1 = np.minimum(pred_boxes[:, 3], gy1)
+        inter = np.maximum(ix1 - ix0, 0) * np.maximum(iy1 - iy0, 0)
+
+        gt_area = max(gx1 - gx0, 0) * max(gy1 - gy0, 0)
+        pred_area = np.maximum(pred_boxes[:, 2] - pred_boxes[:, 0], 0) * np.maximum(
+            pred_boxes[:, 3] - pred_boxes[:, 1], 0
+        )
+        union = gt_area + pred_area - inter
+        iou = np.divide(inter, union, out=np.zeros_like(inter), where=union > 0)
+        if iou.max() >= threshold:
+            hits += 1
+    return hits / len(gt_boxes)
+
+
 def score_order(predictions: list[tuple[list[Point], float]]) -> list[int]:
     """Indices of `predictions` from highest score to lowest.
 
@@ -277,6 +313,75 @@ def evaluate(
     return results
 
 
+def _summarize_stage_recall(
+    stage_data: list[tuple[list, list[float], list, list]],
+) -> dict:
+    """`--stage-recall`'s core logic, kept pure numpy/python (no torch) so it
+    stays unit-testable. `stage_data` is [(gt_boxes, gt_widths,
+    proposal_boxes, detection_boxes), ...] per image -- plain lists, already
+    off any tensor/GPU by the time this runs.
+
+    Recall at each stage is tracked as an INDEPENDENT flag per ground-truth
+    spine, not a shared one: a spine the RPN never proposed cannot appear in
+    detections either, but that must count as one proposal-stage miss AND
+    one detection-stage miss, not be conflated into a single "missed"
+    verdict that hides which stage actually lost it."""
+    all_widths = [width for _, widths, _, _ in stage_data for width in widths]
+    low_edge, high_edge = tercile_edges(all_widths)
+
+    def band_of(width: float) -> str:
+        if width <= low_edge:
+            return "thin"
+        if width <= high_edge:
+            return "medium"
+        return "wide"
+
+    keys = ("overall", "thin", "medium", "wide")
+    hits = {key: {"proposals": 0, "detections_box": 0} for key in keys}
+    counts = {key: 0 for key in keys}
+
+    for gt_boxes, widths, proposal_boxes, detection_boxes in stage_data:
+        for gt_box, width in zip(gt_boxes, widths):
+            band = band_of(width)
+            proposal_hit = box_recall(proposal_boxes, [gt_box]) >= 1.0
+            detection_hit = box_recall(detection_boxes, [gt_box]) >= 1.0
+            for key in ("overall", band):
+                counts[key] += 1
+                hits[key]["proposals"] += int(proposal_hit)
+                hits[key]["detections_box"] += int(detection_hit)
+
+    summary = {}
+    for key in keys:
+        n = counts[key]
+        summary[key] = {
+            "n": n,
+            "proposals": hits[key]["proposals"] / n if n else 0.0,
+            "detections_box": hits[key]["detections_box"] / n if n else 0.0,
+        }
+    return summary
+
+
+def _print_stage_recall(stage_summary: dict, results: dict) -> None:
+    """The descending ladder that localizes a recall loss: proposals should
+    be near 1.0 (allow_low_quality_matches means the RPN gets one attempt at
+    every spine regardless of anchor shape); a drop at detections(box) points
+    at the ROI box head; a drop only at detections(quad) points at the mask
+    head / mask_to_quad."""
+    print("\nrecall by pipeline stage, at IoU 0.50 "
+          "(localizes WHERE a recall loss happens):")
+    for band in ("overall", "thin", "medium", "wide"):
+        stage = stage_summary[band]
+        quad_recall = (
+            results["recall@50"] if band == "overall" else results["by_width"][band]["recall@50"]
+        )
+        print(
+            f"  {band:<8} n={stage['n']:>4}  "
+            f"proposals={stage['proposals']:.3f}  "
+            f"detections(box)={stage['detections_box']:.3f}  "
+            f"detections(quad)={quad_recall:.3f}"
+        )
+
+
 def evaluate_checkpoint(
     checkpoint: str,
     coco_path: str,
@@ -286,6 +391,8 @@ def evaluate_checkpoint(
     log_every: int = 10,
     nms_thresh: float | None = None,
     detections_per_img: int | None = None,
+    rpn_nms_thresh: float | None = None,
+    stage_recall: bool = False,
 ) -> dict:
     """Loads a trained checkpoint, runs it over a COCO split, and returns
     §8א's numbers. Ground truth quads come from the SAME mask_to_quad path
@@ -330,14 +437,21 @@ def evaluate_checkpoint(
     # has to say which configuration produced its numbers, or a sweep's
     # results cannot be told apart afterwards.
     overrides = set_detection_thresholds(
-        model, nms_thresh=nms_thresh, detections_per_img=detections_per_img
+        model,
+        nms_thresh=nms_thresh,
+        detections_per_img=detections_per_img,
+        rpn_nms_thresh=rpn_nms_thresh,
     )
     heads = model.roi_heads
+    # Not "torchvision defaults" vs "overridden": build_model already bakes
+    # in nms_thresh=0.6 (see its docstring), so plainly stating every value
+    # in effect is the only framing that stays true regardless of source.
     print(
-        f"nms_thresh: {heads.nms_thresh}  "
+        f"roi_heads.nms_thresh: {heads.nms_thresh}  "
+        f"rpn.nms_thresh: {model.rpn.nms_thresh}  "
         f"score_thresh: {heads.score_thresh}  "
         f"detections_per_img: {heads.detections_per_img}"
-        + (f"   (overridden: {overrides})" if overrides else "   (torchvision defaults)")
+        + (f"   [CLI overrides this run: {overrides}]" if overrides else "")
     )
 
     model.to(device)
@@ -353,42 +467,87 @@ def evaluate_checkpoint(
     print(f"evaluating {len(dataset)} images  (a line every {log_every})")
     print(f"score threshold: {score_threshold}")
 
+    # Captures the RPN's regressed proposals for the CURRENT image only --
+    # overwritten every forward pass, read immediately after, batch size 1
+    # throughout this loop so output[0][0] is always "this image's proposals".
+    captured_proposals: dict = {}
+    hook_handle = None
+    if stage_recall:
+        print("stage-recall: also measuring proposal-stage and box-stage "
+              "recall, to localize a recall loss to a pipeline stage")
+
+        def _capture_proposals(_module, _inputs, output):
+            captured_proposals["boxes"] = output[0][0]
+
+        hook_handle = model.rpn.register_forward_hook(_capture_proposals)
+
     per_image = []
-    for index in range(len(dataset)):
-        image, target = dataset[index]
-        with torch.no_grad():
-            output = model([image.to(device)])[0]
+    stage_data = []  # (gt_boxes, gt_widths, proposal_boxes, detection_boxes)
+    try:
+        for index in range(len(dataset)):
+            image, target = dataset[index]
+            with torch.no_grad():
+                output = model([image.to(device)])[0]
 
-        keep = output["scores"] >= score_threshold
-        predictions = []
-        # .cpu() before .numpy(): on CUDA the bare .numpy() raises
-        # "can't convert cuda:0 device type tensor to numpy". target["masks"]
-        # below needs no such thing -- ground truth never leaves the CPU.
-        masks = output["masks"][keep].cpu().numpy()
-        for mask, score in zip(masks, output["scores"][keep].tolist()):
-            quad = mask_to_quad(mask[0])
-            if quad is not None:
-                predictions.append((quad, score))
+            keep = output["scores"] >= score_threshold
+            predictions = []
+            # .cpu() before .numpy(): on CUDA the bare .numpy() raises
+            # "can't convert cuda:0 device type tensor to numpy". target["masks"]
+            # below needs no such thing -- ground truth never leaves the CPU.
+            masks = output["masks"][keep].cpu().numpy()
+            for mask, score in zip(masks, output["scores"][keep].tolist()):
+                quad = mask_to_quad(mask[0])
+                if quad is not None:
+                    predictions.append((quad, score))
 
-        ground_truth = [
-            quad
-            for quad in (mask_to_quad(m.numpy()) for m in target["masks"])
-            if quad is not None
-        ]
-        per_image.append((predictions, ground_truth))
+            ground_truth = [
+                quad
+                for quad in (mask_to_quad(m.numpy()) for m in target["masks"])
+                if quad is not None
+            ]
+            per_image.append((predictions, ground_truth))
 
-        if index % log_every == 0:
-            # detections vs gt is the live version of the recall question:
-            # detections sitting far below gt on dense shelves is the
-            # suppression this eval exists to measure.
-            print(
-                f"  image {index:>4}/{len(dataset)}"
-                f"  detections={len(predictions):>3}  gt={len(ground_truth):>3}",
-                flush=True,
-            )
+            if stage_recall:
+                # AABBs of the SAME quads used above, not target["boxes"] --
+                # a mask that fails to produce a quad is already excluded
+                # from `ground_truth`, and re-deriving from it keeps every
+                # stage compared against exactly the same spine set.
+                gt_boxes = []
+                for quad in ground_truth:
+                    xs = [pt[0] for pt in quad]
+                    ys = [pt[1] for pt in quad]
+                    gt_boxes.append([min(xs), min(ys), max(xs), max(ys)])
+                proposal_boxes = captured_proposals.get("boxes")
+                proposal_boxes = (
+                    proposal_boxes.detach().cpu().numpy().tolist()
+                    if proposal_boxes is not None
+                    else []
+                )
+                detection_boxes = output["boxes"][keep].detach().cpu().numpy().tolist()
+                widths = [spine_width(quad) for quad in ground_truth]
+                stage_data.append((gt_boxes, widths, proposal_boxes, detection_boxes))
+
+            if index % log_every == 0:
+                # detections vs gt is the live version of the recall question:
+                # detections sitting far below gt on dense shelves is the
+                # suppression this eval exists to measure.
+                print(
+                    f"  image {index:>4}/{len(dataset)}"
+                    f"  detections={len(predictions):>3}  gt={len(ground_truth):>3}",
+                    flush=True,
+                )
+    finally:
+        if hook_handle is not None:
+            hook_handle.remove()
 
     print("matching and integrating AP...", flush=True)
-    return evaluate(per_image)
+    results = evaluate(per_image)
+
+    if stage_recall:
+        results["stage_recall"] = _summarize_stage_recall(stage_data)
+        _print_stage_recall(results["stage_recall"], results)
+
+    return results
 
 
 def main() -> None:
@@ -423,6 +582,20 @@ def main() -> None:
         help="Override the cap on detections per image (default 100). Only "
              "matters if a dense shelf is actually hitting it.",
     )
+    parser.add_argument(
+        "--rpn-nms-thresh", type=float, default=None,
+        help="Override the RPN's proposal-stage NMS threshold (torchvision "
+             "default 0.7). SEPARATE from --box-nms-thresh: this suppresses "
+             "proposals before the detection head ever sees them, upstream "
+             "of the detection-stage NMS that flag suppresses.",
+    )
+    parser.add_argument(
+        "--stage-recall", action="store_true",
+        help="Also measure recall at the proposal and box-detection stages "
+             "(via a forward hook on the RPN), to localize a recall loss to "
+             "a specific pipeline stage instead of guessing from the final "
+             "number alone. Costs one extra pass over proposals per image.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--report", default=None)
     args = parser.parse_args()
@@ -430,6 +603,7 @@ def main() -> None:
     results = evaluate_checkpoint(
         args.checkpoint, args.coco, args.images_dir, args.score_threshold,
         args.limit, args.log_every, args.box_nms_thresh, args.detections_per_img,
+        args.rpn_nms_thresh, args.stage_recall,
     )
 
     print("=== §8א geometric evaluation (quad IoU, not AABB) ===")
