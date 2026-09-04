@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bookshelf detector — demo</title>
+<!--
+  Reference implementation of the detector call, and the standalone fallback
+  demo if the Lovable integration runs out of time.
+
+  The one non-obvious thing here is DOWNSCALE_LONG_SIDE. Measured over a
+  Cloudflare quick tunnel with a 4080x3072 phone photo:
+
+      full size (4080px)   14.1s round trip, 24 spines
+      half size (2040px)    4.9s round trip, 22 spines, crops equally readable
+
+  The model resizes internally to min_size=800 regardless, so detection never
+  sees full resolution anyway; the only thing full resolution buys is sharper
+  crops, and those are capped server-side at 1024px on the long side. Sending
+  much more than ~2x that cap is paying upload time for pixels nobody reads.
+
+  This page does NOT call the VLM. In the real app the crops go to the
+  existing cloud call; here they are just displayed, so the detector can be
+  judged on its own.
+-->
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --line: #2c313b;
+    --text: #e7e9ee; --muted: #9aa3b2; --accent: #6ea8fe; --ok: #4ade80;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+  label { color: var(--muted); font-size: 13px; }
+  input[type=text], input[type=number] {
+    background: var(--panel); border: 1px solid var(--line); color: var(--text);
+    border-radius: 6px; padding: 7px 10px; font: inherit; font-size: 13px;
+  }
+  input[type=text] { flex: 1; min-width: 280px; direction: ltr; }
+  button {
+    background: var(--accent); color: #0b1220; border: 0; border-radius: 6px;
+    padding: 8px 16px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { margin: 14px 0; font-size: 14px; min-height: 22px; }
+  #status .ok { color: var(--ok); }
+  #wrap { position: relative; display: inline-block; max-width: 100%; }
+  canvas { max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; }
+  #crops { margin-top: 22px; display: grid; gap: 10px; }
+  .crop {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px; display: flex; gap: 12px; align-items: center;
+  }
+  .crop img { max-width: 100%; height: auto; border-radius: 4px; flex: 1; }
+  .score { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 44px; }
+</style>
+</head>
+<body>
+
+<h1>Bookshelf detector</h1>
+<div class="sub">מעלה תמונה של מדף, מסמן כל שדרה, ומחזיר אותה חתוכה ומיושרת — מוכנה לקריאה.</div>
+
+<div class="row">
+  <label for="url">כתובת השרת</label>
+  <input type="text" id="url" placeholder="https://xxx.trycloudflare.com">
+</div>
+<div class="row">
+  <label for="maxside">הקטנה לפני שליחה (פיקסלים)</label>
+  <input type="number" id="maxside" value="2040" min="800" max="6000" step="100">
+  <label><input type="checkbox" id="flip" checked> עברית (טקסט מלמטה למעלה)</label>
+</div>
+<div class="row">
+  <input type="file" id="file" accept="image/*">
+  <button id="go" disabled>זהה</button>
+</div>
+
+<div id="status"></div>
+<div id="wrap"><canvas id="canvas"></canvas></div>
+<div id="crops"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let chosenFile = null;
+
+// Remember the tunnel URL between reloads -- it changes on every restart of
+// `cloudflared`, and retyping it during a demo is exactly when it gets typo'd.
+$("url").value = localStorage.getItem("detectorUrl") || "";
+$("url").addEventListener("change", () => localStorage.setItem("detectorUrl", $("url").value.trim()));
+
+$("file").addEventListener("change", e => {
+  chosenFile = e.target.files[0] || null;
+  $("go").disabled = !chosenFile;
+});
+
+function setStatus(html) { $("status").innerHTML = html; }
+
+/**
+ * Downscale before upload. Returns a Blob plus the scale factor, because the
+ * server returns quads in the coordinates of what it RECEIVED -- so the
+ * canvas must draw the downscaled image, not the original, or the boxes
+ * land in the wrong place.
+ */
+async function downscale(file, maxLongSide) {
+  const bitmap = await createImageBitmap(file);
+  const longSide = Math.max(bitmap.width, bitmap.height);
+  const scale = longSide > maxLongSide ? maxLongSide / longSide : 1;
+
+  const w = Math.round(bitmap.width * scale);
+  const h = Math.round(bitmap.height * scale);
+  const off = document.createElement("canvas");
+  off.width = w; off.height = h;
+  off.getContext("2d").drawImage(bitmap, 0, 0, w, h);
+
+  const blob = await new Promise(res => off.toBlob(res, "image/jpeg", 0.92));
+  return { blob, width: w, height: h };
+}
+
+$("go").addEventListener("click", async () => {
+  const base = $("url").value.trim().replace(/\/$/, "");
+  if (!base) { setStatus("צריך כתובת שרת"); return; }
+
+  $("go").disabled = true;
+  const started = performance.now();
+  setStatus("מקטין ושולח…");
+
+  try {
+    const { blob, width, height } = await downscale(chosenFile, Number($("maxside").value));
+
+    const body = new FormData();
+    body.append("image", blob, "photo.jpg");
+
+    const response = await fetch(`${base}/detect?flip=${$("flip").checked}`, { method: "POST", body });
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+    const data = await response.json();
+
+    // Draw the photo at the size the server saw, then the quads on top.
+    const canvas = $("canvas");
+    canvas.width = width; canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(await createImageBitmap(blob), 0, 0);
+
+    ctx.lineWidth = Math.max(2, Math.round(width / 500));
+    ctx.strokeStyle = "#6ea8fe";
+    ctx.fillStyle = "rgba(110,168,254,.13)";
+    for (const spine of data.spines) {
+      ctx.beginPath();
+      spine.quad.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    $("crops").innerHTML = data.spines.map(s => `
+      <div class="crop">
+        <span class="score">${s.score.toFixed(2)}</span>
+        <img src="data:image/jpeg;base64,${s.crop_jpeg_b64}" alt="">
+      </div>`).join("");
+
+    const total = ((performance.now() - started) / 1000).toFixed(1);
+    setStatus(`<span class="ok">${data.spines.length} שדרות</span> · זיהוי ${data.seconds}s · סה"כ ${total}s · נשלח ${width}×${height}`);
+  } catch (error) {
+    setStatus(`שגיאה: ${error.message}`);
+  } finally {
+    $("go").disabled = false;
+  }
+});
+</script>
+</body>
+</html>

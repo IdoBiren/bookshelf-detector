@@ -40,6 +40,7 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from PIL import Image
 
 from crop_quad import rectify_spine
@@ -100,6 +101,22 @@ def _warm_up() -> None:
     # than the rest (lazy CUDA/cuDNN init, allocator warm-up).
     detect_spines(detector, Image.new("RGB", (640, 480)))
     print("warm-up complete -- ready")
+
+
+# Serving the demo page from the same origin means the tunnel URL alone is
+# the whole demo: no local file to open, no CORS involved at all, and it
+# works from a phone -- photographing a shelf live is a much better demo
+# than uploading a file from a laptop.
+DEMO_PAGE = Path(__file__).resolve().parent.parent / "demo" / "index.html"
+
+
+@app.get("/")
+def demo_page():
+    if not DEMO_PAGE.is_file():
+        raise HTTPException(status_code=404, detail=f"demo page not found at {DEMO_PAGE}")
+    # no-cache: during a demo the page gets tweaked and reloaded, and a
+    # stale cached copy is a confusing way to lose two minutes.
+    return FileResponse(DEMO_PAGE, media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/health")
