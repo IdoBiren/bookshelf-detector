@@ -393,11 +393,21 @@ def evaluate_checkpoint(
     detections_per_img: int | None = None,
     rpn_nms_thresh: float | None = None,
     stage_recall: bool = False,
+    mask_resolution: int | None = None,
 ) -> dict:
     """Loads a trained checkpoint, runs it over a COCO split, and returns
     §8א's numbers. Ground truth quads come from the SAME mask_to_quad path
     the predictions do, so the comparison isn't confounded by two different
     polygon-fitting routes.
+
+    `mask_resolution=None` (the default) reads the checkpoint's OWN recorded
+    value via `read_checkpoint_mask_resolution` and builds the model to
+    match. This matters because it is silently WRONG otherwise, not loudly:
+    mask_head/mask_predictor weight shapes don't depend on this value, so
+    `load_state_dict` does not raise when it disagrees with what the
+    checkpoint was trained at -- it just produces masks from weights that
+    have never seen that resolution. Pass an explicit int only to
+    deliberately force a mismatch (e.g. to see this failure mode itself).
 
     torch is imported lazily here on purpose: every metric function above is
     torch-free and works on plain quads, so all of §8א stays unit-testable
@@ -419,7 +429,7 @@ def evaluate_checkpoint(
     from dataset import SpineDataset
     from mask_to_quad import mask_to_quad
     from model import build_model, set_detection_thresholds
-    from train import load_checkpoint
+    from train import load_checkpoint, read_checkpoint_mask_resolution
 
     # Same selection as train.py: eval was running Mask R-CNN on the CPU
     # while the GPU that just did the training sat idle, which is most of
@@ -427,7 +437,20 @@ def evaluate_checkpoint(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 
-    model = build_model(pretrained=False)
+    resolved_mask_resolution = (
+        mask_resolution
+        if mask_resolution is not None
+        else read_checkpoint_mask_resolution(Path(checkpoint))
+    )
+    print(
+        f"mask_resolution: {resolved_mask_resolution}"
+        + (
+            "  [explicit override]"
+            if mask_resolution is not None
+            else "  [read from checkpoint]"
+        )
+    )
+    model = build_model(pretrained=False, mask_resolution=resolved_mask_resolution)
     # Load onto the CPU first, then move -- load_checkpoint maps to CPU, and
     # this order never holds two copies of the weights on the GPU.
     load_checkpoint(Path(checkpoint), model)
@@ -596,6 +619,13 @@ def main() -> None:
              "a specific pipeline stage instead of guessing from the final "
              "number alone. Costs one extra pass over proposals per image.",
     )
+    parser.add_argument(
+        "--mask-resolution", type=int, default=None,
+        help="Force the mask_roi_pool output size used to BUILD the model, "
+             "overriding what the checkpoint itself recorded. Only needed to "
+             "deliberately evaluate at the wrong resolution; the correct "
+             "value is read automatically from the checkpoint otherwise.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--report", default=None)
     args = parser.parse_args()
@@ -603,7 +633,7 @@ def main() -> None:
     results = evaluate_checkpoint(
         args.checkpoint, args.coco, args.images_dir, args.score_threshold,
         args.limit, args.log_every, args.box_nms_thresh, args.detections_per_img,
-        args.rpn_nms_thresh, args.stage_recall,
+        args.rpn_nms_thresh, args.stage_recall, args.mask_resolution,
     )
 
     print("=== §8א geometric evaluation (quad IoU, not AABB) ===")

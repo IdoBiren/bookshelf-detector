@@ -63,6 +63,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     epoch: int,
     history: list[dict],
+    mask_resolution: int = 14,
 ) -> Path:
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -75,10 +76,23 @@ def save_checkpoint(
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "history": history,
+            "mask_resolution": mask_resolution,
         },
         path,
     )
     return path
+
+
+def read_checkpoint_mask_resolution(path: Path) -> int:
+    """The mask_resolution a checkpoint's weights were built with, recorded
+    at save time so a checkpoint is self-describing. Shapes are compatible
+    across resolutions (mask_head/mask_predictor are conv/deconv layers, so
+    load_state_dict does not raise on a mismatch) -- which means evaluating
+    at the WRONG resolution fails silently, producing garbage instead of an
+    error. Defaults to 14 for a checkpoint saved before this field existed,
+    e.g. checkpoint_epoch_009.pt from the original pretrain run."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    return checkpoint.get("mask_resolution", 14)
 
 
 def load_checkpoint(
@@ -92,6 +106,19 @@ def load_checkpoint(
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return checkpoint["epoch"], checkpoint.get("history", [])
+
+
+def load_model_weights_only(path: Path, model: torch.nn.Module) -> None:
+    """For --init-from: warm-start a NEW run from another run's weights,
+    with a fresh optimizer and epoch counter reset to 0. Unlike
+    load_checkpoint, deliberately ignores that checkpoint's
+    optimizer_state_dict/epoch/history -- this is not resuming that run, it
+    is starting a different one from its weights. Works across different
+    mask_resolution values: mask_head/mask_predictor are conv/deconv layers,
+    so their weight shapes depend on channel counts, not on the spatial size
+    mask_roi_pool produces."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
 
 
 def find_latest_checkpoint(checkpoint_dir: Path) -> Path | None:
@@ -147,6 +174,8 @@ def main(
     limit: int | None = None,
     num_workers: int = 2,
     log_every: int = 20,
+    mask_resolution: int = 14,
+    init_from: str | None = None,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
@@ -170,8 +199,16 @@ def main(
         collate_fn=collate_fn,
     )
 
-    model = build_model(pretrained=True).to(device)
+    # pretrained=False when warm-starting: init_from's state_dict overwrites
+    # the whole model anyway, so downloading ~170MB of COCO weights first
+    # just to discard them is wasted bandwidth.
+    model = build_model(pretrained=init_from is None, mask_resolution=mask_resolution)
     print(f"model: {describe_model(model)}")
+    if init_from:
+        print(f"initializing weights from {init_from}  "
+              "(fresh optimizer, epoch 0 -- this is NOT a resume)")
+        load_model_weights_only(Path(init_from), model)
+    model = model.to(device)
 
     parameters = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(parameters, lr=learning_rate, momentum=0.9, weight_decay=0.0005)
@@ -183,7 +220,8 @@ def main(
         start_epoch = saved_epoch + 1
         print(f"resuming from {latest.name} -> starting at epoch {start_epoch}")
     else:
-        print("no checkpoint found -- starting from scratch")
+        print("no checkpoint found -- starting from scratch"
+              + (" (after --init-from)" if init_from else ""))
 
     for epoch in range(start_epoch, epochs):
         started = time.time()
@@ -192,7 +230,10 @@ def main(
         elapsed = time.time() - started
 
         history.append({"epoch": epoch, "mean_loss": mean_loss, "seconds": elapsed})
-        path = save_checkpoint(Path(checkpoint_dir), model, optimizer, epoch, history)
+        path = save_checkpoint(
+            Path(checkpoint_dir), model, optimizer, epoch, history,
+            mask_resolution=mask_resolution,
+        )
         print(f"epoch {epoch}: mean_loss={mean_loss:.4f}  {elapsed:.0f}s  -> {path.name}", flush=True)
 
     history_path = Path(checkpoint_dir) / "history.json"
@@ -216,6 +257,21 @@ if __name__ == "__main__":
     parser.add_argument("--log-every", type=int, default=20,
                         help="Batches between progress lines. Lower it to tell a slow "
                              "epoch apart from a hang.")
+    parser.add_argument(
+        "--mask-resolution", type=int, default=14,
+        help="mask_roi_pool's output grid size (torchvision default 14). Raising it "
+             "gives a spine's width more pixels to work with before mask_to_quad -- "
+             "see model.build_model's docstring for the measurement this responds to. "
+             "Recorded in every checkpoint this run saves, so evaluate.py can read it "
+             "back instead of needing to be told correctly by hand.",
+    )
+    parser.add_argument(
+        "--init-from", default=None,
+        help="Warm-start from another checkpoint's weights: fresh optimizer, epoch 0 "
+             "-- this is NOT --checkpoint-dir resume, it starts a different run. Works "
+             "across a different --mask-resolution than that checkpoint was saved "
+             "with (mask_head/mask_predictor weight shapes don't depend on it).",
+    )
     args = parser.parse_args()
 
     main(
@@ -228,4 +284,6 @@ if __name__ == "__main__":
         limit=args.limit,
         num_workers=args.num_workers,
         log_every=args.log_every,
+        mask_resolution=args.mask_resolution,
+        init_from=args.init_from,
     )

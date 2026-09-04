@@ -27,6 +27,7 @@ import torch
 import torchvision
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from torchvision.ops import MultiScaleRoIAlign
 
 # Background + spine. One real class on purpose (plan §3): a `non_book`
 # class only gets added if evaluation shows false positives are an actual
@@ -41,6 +42,7 @@ def build_model(
     pretrained: bool = True,
     trainable_backbone_layers: int | None = None,
     nms_thresh: float | None = 0.6,
+    mask_resolution: int = 14,
 ):
     """Mask R-CNN ResNet50-FPN with both predictor heads resized to
     NUM_CLASSES.
@@ -61,7 +63,22 @@ def build_model(
     when the model is in eval() mode. 0.7 was also measured and rejected --
     recall kept climbing but the precision cost overtook it, netting a lower
     mAP than 0.6. Pass `nms_thresh=None` for torchvision's untouched 0.5,
-    e.g. to reproduce the pre-measurement baseline."""
+    e.g. to reproduce the pre-measurement baseline.
+
+    `mask_resolution` overrides `roi_heads.mask_roi_pool`'s output size
+    (torchvision's default is 14, i.e. a 14x14 pooled grid). Still
+    torchvision's own default here -- this is an open question, not a
+    measured result yet. The reason to raise it: a spine's median aspect
+    ratio is 13.8:1 (p90 27.8:1), so even a perfectly boxed spine (box-stage
+    recall measured at 0.99+) has its WIDTH squeezed into ~2px of a 14x14
+    grid (~1px at the p90 ratio) before `mask_to_quad` ever sees it, and
+    quad-stage recall was measured collapsing to ~0.67 immediately
+    downstream of that. Doubling to 28 quadruples that to ~4-8px.
+    `mask_head`/`mask_predictor` are conv/deconv layers, so their weight
+    shapes depend on channel counts, not on this value (pinned by a test) --
+    a checkpoint trained at 14 is expected to load into a model built with a
+    different `mask_resolution` as a warm start, though whether those
+    weights train well at the new resolution is exactly what is untested."""
     # weights_backbone must be pinned off too. torchvision defaults it to
     # ImageNet weights independently of `weights`, so `weights=None` alone
     # still triggers a ~100MB ResNet50 download -- which quietly made the
@@ -79,6 +96,16 @@ def build_model(
     model.roi_heads.mask_predictor = MaskRCNNPredictor(
         in_features_mask, DEFAULT_HIDDEN_LAYER, NUM_CLASSES
     )
+
+    if mask_resolution != 14:
+        # featmap_names / sampling_ratio copied from torchvision's own
+        # maskrcnn_resnet50_fpn construction (verified interactively, not
+        # assumed) -- only output_size is the thing this function changes.
+        model.roi_heads.mask_roi_pool = MultiScaleRoIAlign(
+            featmap_names=["0", "1", "2", "3"],
+            output_size=mask_resolution,
+            sampling_ratio=2,
+        )
 
     if nms_thresh is not None:
         set_detection_thresholds(model, nms_thresh=nms_thresh)

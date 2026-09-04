@@ -87,6 +87,9 @@ class TestBuildModel(unittest.TestCase):
         raw = build_model(pretrained=False, nms_thresh=None)
         self.assertAlmostEqual(raw.roi_heads.nms_thresh, 0.5)
 
+    def test_defaults_to_torchvisions_mask_resolution_of_14(self):
+        self.assertEqual(self.model.roi_heads.mask_roi_pool.output_size, (14, 14))
+
     def test_train_mode_returns_the_four_loss_terms_the_loop_will_sum(self):
         self.model.train()
         image = torch.rand(3, 256, 256)
@@ -101,6 +104,61 @@ class TestBuildModel(unittest.TestCase):
             self.assertIn(key, losses)
         total = sum(losses.values())
         self.assertTrue(torch.isfinite(total), f"non-finite loss: {losses}")
+
+
+class TestMaskResolution(unittest.TestCase):
+    """A 13.8:1 median spine, boxed with near-perfect accuracy (measured
+    recall 0.99+), still loses to quad recall of ~0.67 -- because the fixed
+    14x14 mask_roi_pool grid gives its WIDTH ~2px (p90 spine: ~1px) to work
+    with, and mask_to_quad then fits a quad to that. Raising this resolution
+    is the fix under test; these pins exist because a wrong output_size or a
+    hidden shape mismatch would be a silent failure, not a crash -- exactly
+    the kind of bug the checkpoint-compatibility claim below depends on
+    being false."""
+
+    def test_raises_the_mask_roi_pool_output_size(self):
+        model = build_model(pretrained=False, mask_resolution=28)
+        self.assertEqual(model.roi_heads.mask_roi_pool.output_size, (28, 28))
+
+    def test_mask_head_and_predictor_weight_shapes_are_unchanged(self):
+        """The finding this whole plan is built on: mask_head/mask_predictor
+        are conv/deconv layers, so their weight shapes depend on CHANNEL
+        counts, not on mask_roi_pool's spatial output size. If a future
+        torchvision version breaks this, checkpoint_epoch_009.pt would fail
+        to load into a higher-resolution model with a shape-mismatch error
+        -- this test catches that before a wasted Colab run, not after."""
+        default = build_model(pretrained=False)
+        raised = build_model(pretrained=False, mask_resolution=28)
+
+        default_head = {k: v.shape for k, v in default.roi_heads.mask_head.state_dict().items()}
+        raised_head = {k: v.shape for k, v in raised.roi_heads.mask_head.state_dict().items()}
+        self.assertEqual(default_head, raised_head)
+
+        default_pred = {k: v.shape for k, v in default.roi_heads.mask_predictor.state_dict().items()}
+        raised_pred = {k: v.shape for k, v in raised.roi_heads.mask_predictor.state_dict().items()}
+        self.assertEqual(default_pred, raised_pred)
+
+    def test_a_checkpoint_trained_at_14_loads_into_a_28_model(self):
+        """The actual compatibility claim, not just matching shapes in the
+        abstract: load_state_dict must not raise."""
+        source = build_model(pretrained=False)
+        target = build_model(pretrained=False, mask_resolution=28)
+        target.load_state_dict(source.state_dict())  # raises on any mismatch
+
+    def test_higher_resolution_model_still_runs_end_to_end(self):
+        model = build_model(pretrained=False, mask_resolution=28)
+        model.eval()
+        with torch.no_grad():
+            output = model([torch.rand(3, 256, 256)])
+        for key in ("boxes", "labels", "scores", "masks"):
+            self.assertIn(key, output[0])
+
+    def test_default_resolution_is_still_14_when_not_asked_for(self):
+        """The other half of the compatibility claim: this is an opt-in
+        change, not a silent default flip that would make every EXISTING
+        caller's checkpoints subtly wrong."""
+        model = build_model(pretrained=False)
+        self.assertEqual(model.roi_heads.mask_roi_pool.output_size, (14, 14))
 
 
 class TestDescribeModel(unittest.TestCase):

@@ -21,7 +21,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch  # noqa: E402
 
-from train import find_latest_checkpoint, load_checkpoint, save_checkpoint  # noqa: E402
+from train import (  # noqa: E402
+    find_latest_checkpoint,
+    load_checkpoint,
+    load_model_weights_only,
+    read_checkpoint_mask_resolution,
+    save_checkpoint,
+)
 
 
 class _TinyModel(torch.nn.Module):
@@ -67,6 +73,80 @@ class TestCheckpointRoundTrip(unittest.TestCase):
             saved_state = optimizer.state_dict()["state"]
             restored_state = restored_optimizer.state_dict()["state"]
             self.assertEqual(len(saved_state), len(restored_state))
+
+
+class TestMaskResolutionRecording(unittest.TestCase):
+    """A checkpoint has to be self-describing about what mask_resolution it
+    was built with -- shapes are compatible across resolutions (that's the
+    whole point of --init-from), so a wrong evaluate.py build silently
+    succeeds and produces garbage instead of raising. This is what closes
+    that gap: the checkpoint carries the fact, evaluate.py doesn't have to
+    be told it correctly by a human who could forget."""
+
+    def test_recorded_resolution_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = _TinyModel(1.0)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+            path = save_checkpoint(
+                Path(tmp), model, optimizer, epoch=0, history=[], mask_resolution=28
+            )
+            self.assertEqual(read_checkpoint_mask_resolution(path), 28)
+
+    def test_a_checkpoint_saved_before_this_field_existed_reads_as_14(self):
+        """Backward compatibility with checkpoint_epoch_009.pt, saved by an
+        older save_checkpoint that never wrote this key at all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkpoint_epoch_000.pt"
+            torch.save({"epoch": 0, "model_state_dict": {}, "history": []}, path)
+            self.assertEqual(read_checkpoint_mask_resolution(path), 14)
+
+    def test_default_save_records_14(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = _TinyModel(1.0)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+            path = save_checkpoint(Path(tmp), model, optimizer, epoch=0, history=[])
+            self.assertEqual(read_checkpoint_mask_resolution(path), 14)
+
+
+class TestLoadModelWeightsOnly(unittest.TestCase):
+    """--init-from warm-starts a NEW run from another run's weights --
+    fresh optimizer, epoch counter reset to 0. It must ignore whatever
+    optimizer/epoch/history that other checkpoint carries, unlike
+    load_checkpoint which restores all of it for an actual resume."""
+
+    def test_loads_weights_and_ignores_optimizer_and_epoch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = _TinyModel(3.5)
+            source_optimizer = torch.optim.SGD(source.parameters(), lr=0.1, momentum=0.9)
+            source(torch.tensor([2.0])).backward()
+            source_optimizer.step()
+            path = save_checkpoint(
+                Path(tmp), source, source_optimizer, epoch=7, history=[{"loss": 1.0}]
+            )
+
+            target = _TinyModel(0.0)
+            load_model_weights_only(path, target)
+
+            self.assertAlmostEqual(float(target.weight.item()), float(source.weight.item()), places=6)
+
+    def test_works_across_different_mask_resolutions(self):
+        """The actual scenario this exists for: source and target were built
+        with DIFFERENT mask_resolution values, and this must still work
+        because mask_head/mask_predictor weight shapes don't depend on it."""
+        import sys as _sys
+
+        _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from model import build_model
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = build_model(pretrained=False, mask_resolution=14)
+            optimizer = torch.optim.SGD(
+                [p for p in source.parameters() if p.requires_grad], lr=0.1
+            )
+            path = save_checkpoint(Path(tmp), source, optimizer, epoch=9, history=[])
+
+            target = build_model(pretrained=False, mask_resolution=28)
+            load_model_weights_only(path, target)  # must not raise
 
 
 class TestFindLatestCheckpoint(unittest.TestCase):
