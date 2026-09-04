@@ -22,7 +22,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch  # noqa: E402
 
-from model import NUM_CLASSES, build_model, describe_model  # noqa: E402
+from model import (  # noqa: E402
+    NUM_CLASSES,
+    build_model,
+    describe_model,
+    set_detection_thresholds,
+)
 
 
 class TestBuildModel(unittest.TestCase):
@@ -93,6 +98,71 @@ class TestDescribeModel(unittest.TestCase):
         self.assertGreater(info["total_params"], 10_000_000)
         self.assertLess(info["total_params"], 100_000_000)
         self.assertGreater(info["size_mb_fp32"], 0)
+
+
+class TestSetDetectionThresholds(unittest.TestCase):
+    """The constructor names these `box_nms_thresh` / `box_score_thresh`,
+    but RoIHeads stores them as `nms_thresh` / `score_thresh`. Assigning the
+    constructor name to a built model does not fail -- it silently creates an
+    unused attribute, inference is completely unaffected, and an NMS sweep
+    would come back flat and be read as "NMS is not the problem".
+
+    That wrong conclusion is the reason this seam is a function with tests
+    rather than two lines in evaluate.py."""
+
+    def setUp(self):
+        self.model = build_model(pretrained=False)
+
+    def test_torchvision_defaults_are_what_we_think_they_are(self):
+        """Pinned because the whole recall investigation is reasoned against
+        these three numbers. If a torchvision upgrade moves them, the
+        measured history stops being comparable and we want to be told."""
+        heads = self.model.roi_heads
+        self.assertAlmostEqual(heads.nms_thresh, 0.5)
+        self.assertAlmostEqual(heads.score_thresh, 0.05)
+        self.assertEqual(heads.detections_per_img, 100)
+
+    def test_sets_the_attribute_inference_actually_reads(self):
+        set_detection_thresholds(self.model, nms_thresh=0.7)
+        self.assertAlmostEqual(self.model.roi_heads.nms_thresh, 0.7)
+
+    def test_does_not_create_the_constructor_spelling(self):
+        """The bug this function exists to prevent."""
+        set_detection_thresholds(self.model, nms_thresh=0.7)
+        self.assertFalse(hasattr(self.model.roi_heads, "box_nms_thresh"))
+
+    def test_none_leaves_a_threshold_untouched(self):
+        set_detection_thresholds(self.model, nms_thresh=0.7)
+        set_detection_thresholds(self.model, score_thresh=0.01)
+        self.assertAlmostEqual(self.model.roi_heads.nms_thresh, 0.7)
+        self.assertAlmostEqual(self.model.roi_heads.score_thresh, 0.01)
+
+    def test_sets_all_three_together(self):
+        set_detection_thresholds(
+            self.model, nms_thresh=0.8, score_thresh=0.02, detections_per_img=300
+        )
+        heads = self.model.roi_heads
+        self.assertAlmostEqual(heads.nms_thresh, 0.8)
+        self.assertAlmostEqual(heads.score_thresh, 0.02)
+        self.assertEqual(heads.detections_per_img, 300)
+
+    def test_returns_what_it_changed_for_the_record(self):
+        """evaluate.py prints this, so a run's output says which thresholds
+        produced its numbers instead of leaving it to the shell history."""
+        changed = set_detection_thresholds(self.model, nms_thresh=0.7)
+        self.assertEqual(changed, {"nms_thresh": 0.7})
+        self.assertEqual(set_detection_thresholds(self.model), {})
+
+    def test_rejects_a_threshold_outside_zero_to_one(self):
+        """A typo'd 7 instead of 0.7 disables NMS entirely and silently
+        returns up to detections_per_img boxes per spine."""
+        for bad in (-0.1, 1.5, 7):
+            with self.assertRaises(ValueError):
+                set_detection_thresholds(self.model, nms_thresh=bad)
+
+    def test_rejects_non_positive_detection_cap(self):
+        with self.assertRaises(ValueError):
+            set_detection_thresholds(self.model, detections_per_img=0)
 
 
 if __name__ == "__main__":

@@ -284,6 +284,8 @@ def evaluate_checkpoint(
     score_threshold: float = 0.5,
     limit: int | None = None,
     log_every: int = 10,
+    nms_thresh: float | None = None,
+    detections_per_img: int | None = None,
 ) -> dict:
     """Loads a trained checkpoint, runs it over a COCO split, and returns
     §8א's numbers. Ground truth quads come from the SAME mask_to_quad path
@@ -309,7 +311,7 @@ def evaluate_checkpoint(
 
     from dataset import SpineDataset
     from mask_to_quad import mask_to_quad
-    from model import build_model
+    from model import build_model, set_detection_thresholds
     from train import load_checkpoint
 
     # Same selection as train.py: eval was running Mask R-CNN on the CPU
@@ -322,6 +324,22 @@ def evaluate_checkpoint(
     # Load onto the CPU first, then move -- load_checkpoint maps to CPU, and
     # this order never holds two copies of the weights on the GPU.
     load_checkpoint(Path(checkpoint), model)
+
+    # Post-processing thresholds are inference-time only, so sweeping them
+    # needs no retraining. Printed rather than assumed: a run's own output
+    # has to say which configuration produced its numbers, or a sweep's
+    # results cannot be told apart afterwards.
+    overrides = set_detection_thresholds(
+        model, nms_thresh=nms_thresh, detections_per_img=detections_per_img
+    )
+    heads = model.roi_heads
+    print(
+        f"nms_thresh: {heads.nms_thresh}  "
+        f"score_thresh: {heads.score_thresh}  "
+        f"detections_per_img: {heads.detections_per_img}"
+        + (f"   (overridden: {overrides})" if overrides else "   (torchvision defaults)")
+    )
+
     model.to(device)
     model.eval()
 
@@ -391,13 +409,27 @@ def main() -> None:
     )
     parser.add_argument("--log-every", type=int, default=10,
                         help="Print a progress line every N images.")
+    parser.add_argument(
+        "--box-nms-thresh", type=float, default=None,
+        help="Override the detection head's NMS IoU threshold (torchvision "
+             "default 0.5). Inference-time only, so no retraining. Raising it "
+             "suppresses less: if recall climbs, the detections existed and "
+             "axis-aligned NMS was discarding them, which is the case for "
+             "mask-based NMS. Expect AP to fall as precision drops -- that "
+             "cost is the point, not a side effect.",
+    )
+    parser.add_argument(
+        "--detections-per-img", type=int, default=None,
+        help="Override the cap on detections per image (default 100). Only "
+             "matters if a dense shelf is actually hitting it.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--report", default=None)
     args = parser.parse_args()
 
     results = evaluate_checkpoint(
         args.checkpoint, args.coco, args.images_dir, args.score_threshold,
-        args.limit, args.log_every,
+        args.limit, args.log_every, args.box_nms_thresh, args.detections_per_img,
     )
 
     print("=== §8א geometric evaluation (quad IoU, not AABB) ===")

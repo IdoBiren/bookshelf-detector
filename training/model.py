@@ -71,6 +71,56 @@ def build_model(pretrained: bool = True, trainable_backbone_layers: int | None =
     return model
 
 
+def set_detection_thresholds(
+    model: torch.nn.Module,
+    nms_thresh: float | None = None,
+    score_thresh: float | None = None,
+    detections_per_img: int | None = None,
+) -> dict:
+    """Override the detection head's post-processing thresholds on a model
+    that is already built. Returns only what it changed, so a caller can
+    print it and have the run's output record its own configuration.
+
+    `build_model` sets none of these, so torchvision's defaults apply:
+    nms_thresh=0.5, score_thresh=0.05, detections_per_img=100.
+
+    Exists as a tested function because the names do not match and the
+    mismatch fails silently. The MaskRCNN CONSTRUCTOR takes
+    `box_nms_thresh`; RoIHeads STORES it as `nms_thresh`. Assigning
+    `roi_heads.box_nms_thresh = 0.7` raises nothing, changes nothing, and an
+    NMS sweep built that way comes back flat -- which reads exactly like
+    "NMS is not the bottleneck" and would retire a live hypothesis on a
+    typo.
+
+    The range checks are for the same reason. `nms_thresh=7` (a dropped
+    decimal point) disables suppression completely rather than loosening it,
+    and the result is a plausible-looking recall jump caused by returning
+    every proposal."""
+    changed: dict = {}
+
+    for name, value in (("nms_thresh", nms_thresh), ("score_thresh", score_thresh)):
+        if value is None:
+            continue
+        if not 0.0 <= float(value) <= 1.0:
+            raise ValueError(
+                f"{name} must be in [0.0, 1.0], got {value!r}. "
+                "These are IoU/probability thresholds -- a value above 1 "
+                "disables the filter instead of tightening it."
+            )
+        setattr(model.roi_heads, name, float(value))
+        changed[name] = float(value)
+
+    if detections_per_img is not None:
+        if int(detections_per_img) < 1:
+            raise ValueError(
+                f"detections_per_img must be >= 1, got {detections_per_img!r}"
+            )
+        model.roi_heads.detections_per_img = int(detections_per_img)
+        changed["detections_per_img"] = int(detections_per_img)
+
+    return changed
+
+
 def describe_model(model: torch.nn.Module) -> dict:
     """Parameter count and fp32 footprint, for the record.
 
