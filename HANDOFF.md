@@ -73,9 +73,9 @@ proceeding. Stage 7's calibration is no longer a blind sweep — the
 **Tests, both green as of this handoff:**
 ```bash
 npx vitest run                                         # 34/34 (browser/TS)
-cd training && python -m unittest discover -s tests    # 176/176 (pipeline/Python)
+cd training && python -m unittest discover -s tests    # 211/211 (pipeline/Python), as of 5224014
 #   ^ needs training/.venv/Scripts/python.exe -- the system 3.14 has no torch,
-#     so test_dataset/test_model/test_train fail to import and you see 146.
+#     so test_dataset/test_model/test_train fail to import and the count is lower.
 ```
 
 ### ⚠️ Two Pythons on this machine — pick the right one
@@ -345,6 +345,78 @@ reproduce 0.5585 as a control.
 previous session's handoff ("check whether this survives the full Colab
 run") was passed — 0.5585 held up on held-out data — but passing it no
 longer means what it was taken to mean.
+
+---
+
+### 2026-09-04, later: recall localized to the mask stage, then the fix failed
+
+`--stage-recall` (`1994eaf`) instruments a forward hook on `model.rpn` to
+measure recall at three points — proposals, box detections, quad detections
+— overall and per width band, on `checkpoint_epoch_009.pt` /
+`pretrain_val.json`:
+
+```
+stage      overall  thin    medium  wide
+proposals   0.617   0.408   0.630   0.814
+box         0.994   0.991   1.000   0.992
+quad        0.673   0.607   0.620   0.791
+```
+
+Two things, confirmed on real data (not stage-5's 20-image checkpoint,
+which was too saturated to show the first one): the RPN's anchors really
+are bad for a 13.8:1-median spine (proposal recall 0.408 for thin vs 0.814
+for wide), **and** the ROI box head's regression erases nearly all of that
+damage one stage later (box recall 0.99+ across every band, aspect ratio
+irrelevant). Anchors are corrected downstream and are not the bottleneck.
+The quad stage then reintroduces almost the identical band-wise gap that
+box regression had just erased.
+
+**The proposed fix — raising `mask_roi_pool`'s output size 14→28
+(`5224014`) — made every number worse**, not better:
+
+```
+              mAP@50   recall@50   quad thin  quad medium  quad wide
+14x14 base    0.5833   0.6726      0.607      0.620        0.791
+28x28, 5 ep   0.4386   0.5894      0.528      0.538        0.702
+```
+
+**The mechanism behind that fix was wrong.** It was framed as "a 14x14 grid
+gives a 13.8:1 spine ~2px of width." Measuring what actually feeds the
+mask head — torchvision's `LevelMapper`, which assigns each detection to an
+FPN level by **box area** — the real number is far smaller: a thin spine's
+median width is **0.23 feature cells** at its assigned level (p90: 0.54;
+56% of all spines are under 1.0 cell). Doubling the pooling grid samples
+that same coarse feature map twice as densely — interpolation between
+identical cells, not new information. The 14×14 grid was never the limit;
+the feature map itself is, upstream of it. Root cause: `LevelMapper` keys
+off box **area**, so an 8×118px spine (area ≈ a 32×32 blob) gets sent to a
+coarse level, while the dimension that actually matters — its width — is
+exactly what needed a fine one.
+
+**The 28×28 run is also confounded and not fully explained by the above.**
+`--init-from` warm-started from epoch 9's weights but deliberately discards
+`optimizer_state_dict`, and `train.py` runs SGD at a constant
+`lr=0.005` (no scheduler, still true) — so the run changed resolution *and*
+restarted a converged model's optimizer from cold at the same time. The
+14.5pp mAP drop has not been split between "resolution genuinely hurt" and
+"5 epochs of cold-optimizer restart hurt", and the feature-cell math above
+says the honest prior is that resolution alone is closer to neutral.
+
+**Unresolved, next for whoever picks this up:**
+1. Read `checkpoints_maskres28/history.json` — if its epoch-4 loss is well
+   above the original run's final 0.504, the run was simply undertrained by
+   the restart and resolution is not yet tested at all.
+2. Run the missing control: identical `--init-from` + fresh-optimizer + 5
+   epochs, with `--mask-resolution 14` (i.e. revert only the one variable).
+   No new code needed, both flags exist as of `5224014`.
+3. Only then consider a fix that changes the *feature map*, not the pooling
+   grid — the leading candidate is lowering `MultiScaleRoIAlign`'s
+   `LevelMapper` `canonical_scale` (default 224) so elongated boxes get
+   pushed to a finer FPN level, since 58% of spines currently land at stride
+   8 and 33% at stride 16 despite needing sub-cell resolution.
+
+`checkpoint_epoch_009.pt` is untouched throughout — both the 28×28 and any
+control run write to their own `--checkpoint-dir`, never overwriting it.
 
 ---
 
