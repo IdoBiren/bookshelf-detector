@@ -447,6 +447,49 @@ section writes to its own `--checkpoint-dir`, never overwriting it.
 
 ---
 
+### 2026-09-04: the headline metric was measured on the wrong distribution
+
+`mAP@50 = 0.6618` / `recall@50 = 0.7398` (checkpoint `ctrl14` epoch 4) is an
+average over `pretrain_val`, and `pretrain_val` is dominated by **dense**
+shelves. The product asks a user to photograph **~5-8 books** (see "What
+this is"). Bucketing the same 147 images by how many books are in the shot:
+
+```
+books in shot   images   recall@50
+1-5                 15       0.933
+6-8                 16       0.974
+9-14                20       0.816
+15-21               73       0.750
+22+                 23       0.586
+ALL                147       0.776
+```
+
+**At the product's actual use case the model recalls 93-97%.** The
+aggregate is dragged down by 15-21-book images, which are half the val set
+and are not what anyone will photograph. Every "the ceiling is 0.66"
+statement in this file should be read with that in mind: it is the ceiling
+on a distribution the product does not serve.
+
+This does not retire the thin-spine weakness (`thin` quad recall 0.650 vs
+`wide` 0.860) -- it explains where it bites. Thin spines are hard mainly
+*because* they appear in tightly packed shelves, which is also where
+density hurts.
+
+Two practical consequences, both measured:
+
+- **Do not lower the serving score threshold to find more books.** The
+  score is well calibrated: on a packed-shelf crop, the three detections
+  above 0.98 had tight, accurate quads, while the one at 0.33 was a
+  lopsided pentagon cutting through a book. Lowering the threshold buys
+  badly-cropped books, not more usable ones. 0.5 stays right.
+- **Cropping a dense shelf is not a substitute for a sparse photo.** A
+  ~5-book window cut out of a 24-book shelf still has the books touching,
+  and scored like a dense image (3-4 of 5), not like the 0.93 bucket. The
+  5-8 book numbers above come from images that genuinely contain that many
+  books. Anyone validating the sparse case needs real sparse photos.
+
+---
+
 ## Open questions for whoever picks this up
 
 1. ~~**`shrink_ratio` / `unclip_ratio` are tuned for text lines, not books**~~
