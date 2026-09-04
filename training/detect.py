@@ -37,18 +37,32 @@ from polygon_offset import Point
 from train import load_checkpoint, read_checkpoint_mask_resolution
 
 # 0.05 is torchvision's own box_score_thresh and the value §8א measures at,
-# but it emits 70-100 detections on a dense shelf -- unusable in a UI. 0.5
-# costs only ~1.4pp of recall (measured: 0.6412 -> 0.6277) while removing
-# most of the false positives, so serving defaults there and evaluation
-# keeps its own default.
-DEFAULT_SERVING_SCORE_THRESHOLD = 0.5
+# but it emits 70-100 detections on a dense shelf -- unusable in a UI.
+# Serving sits at 0.8. Sweeping 0.5 -> 0.9 on 45 val images barely moves the
+# aggregate (recall 0.740 -> 0.735, precision 0.783 -> 0.791), so this is not
+# the lever it looks like; 0.8 is taken because the recall cost is ~0.3pp,
+# i.e. nothing, and it removes the occasional visibly-wrong sliver that on a
+# real phone photo scored 0.64 while every real book scored 0.96+.
+DEFAULT_SERVING_SCORE_THRESHOLD = 0.8
 
 # Quad-IoU NMS over the final detections. torchvision's own NMS is
 # axis-aligned, so two crops of the same tilted spine survive it -- measured
 # on a phone photo of ~10 books, 3 of 12 detections were second copies of a
-# book already found. 0.5 is deliberately the same threshold section 8a
-# scores at.
-DEFAULT_DEDUP_IOU = 0.5
+# book already found.
+#
+# 0.35, not the 0.5 section 8a scores at, because 0.5 does not finish the
+# job: two crops of ONE book can cover different extents of it (one truncated
+# part-way) and overlap less than half, which is exactly what left a
+# duplicate on screen after the first attempt. Swept on 45 val images,
+# counting pairs overlapping at 0.35+:
+#
+#     off   29 pairs, recall 0.748      0.35   0 pairs, recall 0.740
+#     0.5   12 pairs, recall 0.744      0.30   0 pairs, recall 0.740
+#     0.4    5 pairs, recall 0.742      0.25   0 pairs, recall 0.738
+#
+# 0.35 is the knee: every duplicate gone, and going lower buys nothing while
+# starting to merge genuinely adjacent books.
+DEFAULT_DEDUP_IOU = 0.35
 
 
 @dataclass
