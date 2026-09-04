@@ -348,7 +348,7 @@ longer means what it was taken to mean.
 
 ---
 
-### 2026-09-04, later: recall localized to the mask stage, then the fix failed
+### 2026-09-04, later: recall localized to the mask stage, resolution fix rejected, training budget was the real gap
 
 `--stage-recall` (`1994eaf`) instruments a forward hook on `model.rpn` to
 measure recall at three points — proposals, box detections, quad detections
@@ -393,30 +393,57 @@ off box **area**, so an 8×118px spine (area ≈ a 32×32 blob) gets sent to a
 coarse level, while the dimension that actually matters — its width — is
 exactly what needed a fine one.
 
-**The 28×28 run is also confounded and not fully explained by the above.**
-`--init-from` warm-started from epoch 9's weights but deliberately discards
-`optimizer_state_dict`, and `train.py` runs SGD at a constant
-`lr=0.005` (no scheduler, still true) — so the run changed resolution *and*
-restarted a converged model's optimizer from cold at the same time. The
-14.5pp mAP drop has not been split between "resolution genuinely hurt" and
-"5 epochs of cold-optimizer restart hurt", and the feature-cell math above
-says the honest prior is that resolution alone is closer to neutral.
+**The 28×28 run was also confounded, and the control resolved it —
+inverting the conclusion rather than just confirming it.** `--init-from`
+warm-started from epoch 9's weights but deliberately discards
+`optimizer_state_dict`, so the run changed resolution *and* restarted a
+converged model's optimizer from cold at the same time. Running the exact
+same restart at `--mask-resolution 14` (i.e. reverting only that one
+variable) gave:
 
-**Unresolved, next for whoever picks this up:**
-1. Read `checkpoints_maskres28/history.json` — if its epoch-4 loss is well
-   above the original run's final 0.504, the run was simply undertrained by
-   the restart and resolution is not yet tested at all.
-2. Run the missing control: identical `--init-from` + fresh-optimizer + 5
-   epochs, with `--mask-resolution 14` (i.e. revert only the one variable).
-   No new code needed, both flags exist as of `5224014`.
-3. Only then consider a fix that changes the *feature map*, not the pooling
-   grid — the leading candidate is lowering `MultiScaleRoIAlign`'s
-   `LevelMapper` `canonical_scale` (default 224) so elongated boxes get
-   pushed to a finer FPN level, since 58% of spines currently land at stride
-   8 and 33% at stride 16 despite needing sub-cell resolution.
+```
+                          mAP@50   recall@50   quad thin  quad medium  quad wide
+epoch 9, no extra training 0.5833   0.6726      0.607      0.620        0.791
++5 epochs @ resolution 14   0.6618   0.7398      0.650      0.709        0.860
++5 epochs @ resolution 28   0.4386   0.5894      0.528      0.538        0.702
+```
 
-`checkpoint_epoch_009.pt` is untouched throughout — both the 28×28 and any
-control run write to their own `--checkpoint-dir`, never overwriting it.
+**The cold restart did not hurt — it produced the largest single gain of
+the whole investigation**, +7.85pp mAP@50 from five epochs. That means
+28×28's correct comparison is against 0.6618, not 0.5833: its real cost is
+**−22.3pp, not −14.5pp**. Combined with the feature-cell math above, the
+door on `mask_resolution` is closed, not just left ajar.
+
+**This also retracts an earlier claim in this same session:** the original
+10-epoch run's loss delta (0.5088→0.5040, under 1%) was read as "training
+had converged, more epochs would buy little." That was wrong. Training-loss
+flattening at a constant LR did not predict evaluation quality — five more
+epochs bought nearly 8 points of mAP. Judge convergence from an **eval**
+number from here on, never from a training-loss delta.
+
+Where the gain landed confirms this was a training-budget problem, not an
+architecture one: `proposals` rose modestly (0.617→0.677), `box` stayed
+pinned at its already-saturated 0.994, and **`quad` rose 0.673→0.740** — the
+mask head is the part still learning. `thin` quad recall (0.650) still
+trails `wide` (0.860), so the aspect-ratio story is not gone, but it is no
+longer the top lever: ordinary continued training is still outperforming
+every structural change tried this session.
+
+**Not yet done, next for whoever picks this up:** the quality ceiling this
+whole phase exists to produce is not found yet — 0.6618 is a floor that was
+still climbing when last measured, five epochs is not a plateau, and the
+browser-vs-server decision cannot be taken against a number still moving.
+Next: an LR step-down (`--learning-rate 0.0005` via another cold
+`--init-from` restart from `checkpoints_ctrl14/checkpoint_epoch_004.pt`, no
+new code needed), then continued training with the existing resume path
+until two successive **eval** runs move `mAP@50` by under ~1pp. Only once
+that plateaus does `MultiScaleRoIAlign`'s `LevelMapper` `canonical_scale`
+(which moves elongated boxes to a finer FPN level, changing the feature map
+itself rather than re-sampling it) become the next structural lever worth
+trying.
+
+`checkpoint_epoch_009.pt` is untouched throughout — every run in this
+section writes to its own `--checkpoint-dir`, never overwriting it.
 
 ---
 
