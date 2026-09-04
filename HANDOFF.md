@@ -73,7 +73,9 @@ proceeding. Stage 7's calibration is no longer a blind sweep — the
 **Tests, both green as of this handoff:**
 ```bash
 npx vitest run                                         # 34/34 (browser/TS)
-cd training && python -m unittest discover -s tests    # 166/166 (pipeline/Python)
+cd training && python -m unittest discover -s tests    # 176/176 (pipeline/Python)
+#   ^ needs training/.venv/Scripts/python.exe -- the system 3.14 has no torch,
+#     so test_dataset/test_model/test_train fail to import and you see 146.
 ```
 
 ### ⚠️ Two Pythons on this machine — pick the right one
@@ -309,6 +311,40 @@ Not a hard ceiling, and **not yet a verdict**:
 
 Width breakdown is consistent with the same cause: thin and medium spines
 pack closer together than wide ones, so they lose more to NMS.
+
+### Correction, 2026-09-04: the attribution above is confounded
+
+Read this before acting on the NMS conclusion. Two parts of it have held up
+differently.
+
+**Still solid:** raising `box_nms_thresh` 0.5 → 0.7 took the densest image
+from 12 detections to 29. Both runs applied the same score filter, so that
+delta is purely an NMS effect. NMS *is* suppressing real detections.
+
+**Confounded:** the claim that NMS explains the *size* of the mAP gap.
+`evaluate.py` was discarding every detection below `--score-threshold 0.5`
+before AP was computed, while `average_precision` divides by the full
+ground-truth count — so dropped detections cap recall, and each of the 101
+recall points above the cap contributes 0.0 to the mean. AP was bounded by
+achieved recall. The model emits down to `box_score_thresh=0.05`, so
+everything from 0.05 to 0.5 was produced and then binned by our own eval.
+
+Both causes are recall losses, so they are **additive, not rival** — the
+open question is the split between them, not which one is real. Stage 5's
+0.5642 and the full run's 0.5585 are therefore both understated by an
+unknown amount, and neither is a quality ceiling.
+
+`9cd50dc` reports `recall@50` overall and per band to separate them, and
+caches the per-image IoU matrix so running at 0.05 is affordable (the
+threshold sweep alone was re-rasterizing every polygon pair ten times;
+measured 9.8x). The two-point experiment — same checkpoint, same data,
+`--score-threshold 0.5` then `0.05` — is what settles it. The 0.5 run must
+reproduce 0.5585 as a control.
+
+**Do not build mask-based NMS until that split is known.** The gate in the
+previous session's handoff ("check whether this survives the full Colab
+run") was passed — 0.5585 held up on held-out data — but passing it no
+longer means what it was taken to mean.
 
 ---
 
