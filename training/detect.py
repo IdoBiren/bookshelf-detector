@@ -30,6 +30,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from evaluate import deduplicate_quads
 from mask_to_quad import mask_to_quad
 from model import build_model, set_detection_thresholds
 from polygon_offset import Point
@@ -41,6 +42,13 @@ from train import load_checkpoint, read_checkpoint_mask_resolution
 # most of the false positives, so serving defaults there and evaluation
 # keeps its own default.
 DEFAULT_SERVING_SCORE_THRESHOLD = 0.5
+
+# Quad-IoU NMS over the final detections. torchvision's own NMS is
+# axis-aligned, so two crops of the same tilted spine survive it -- measured
+# on a phone photo of ~10 books, 3 of 12 detections were second copies of a
+# book already found. 0.5 is deliberately the same threshold section 8a
+# scores at.
+DEFAULT_DEDUP_IOU = 0.5
 
 
 @dataclass
@@ -100,7 +108,11 @@ def load_detector(
     )
 
 
-def detect_spines(detector: Detector, image: Image.Image) -> list[dict]:
+def detect_spines(
+    detector: Detector,
+    image: Image.Image,
+    dedup_iou: float | None = DEFAULT_DEDUP_IOU,
+) -> list[dict]:
     """One image -> [{"quad": [(x, y) x4], "score": float}], in the ORIGINAL
     image's pixel coordinates.
 
@@ -117,12 +129,22 @@ def detect_spines(detector: Detector, image: Image.Image) -> list[dict]:
     masks = output["masks"][keep].cpu().numpy()
     scores = output["scores"][keep].tolist()
 
-    spines: list[dict] = []
+    found: list[tuple[list[Point], float]] = []
     for mask, score in zip(masks, scores):
         quad: list[Point] | None = mask_to_quad(mask[0])
         if quad is not None:
-            spines.append({"quad": [(float(x), float(y)) for x, y in quad], "score": float(score)})
-    return spines
+            found.append((quad, float(score)))
+
+    # After mask_to_quad, not before: the duplicates being removed are
+    # duplicates OF QUADS, and two boxes that NMS kept can still collapse to
+    # the same quad.
+    if dedup_iou is not None:
+        found = deduplicate_quads(found, iou_threshold=dedup_iou)
+
+    return [
+        {"quad": [(float(x), float(y)) for x, y in quad], "score": score}
+        for quad, score in found
+    ]
 
 
 def main() -> None:

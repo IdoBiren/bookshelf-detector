@@ -66,6 +66,38 @@ def quad_iou(quad_a: list[Point], quad_b: list[Point]) -> float:
     return int((mask_a & mask_b).sum()) / union
 
 
+def deduplicate_quads(
+    predictions: list[tuple[list[Point], float]], iou_threshold: float = 0.5
+) -> list[tuple[list[Point], float]]:
+    """Greedy score-ranked NMS on QUADS, applied to final detections.
+
+    Measured need, on a phone photo of ~10 books: 12 detections came back,
+    three of them a second copy of a book already found -- the same title
+    cropped twice, at 0.99/0.98, 0.98/0.87 and 0.98/0.52. Across 60
+    validation images, 16 had at least one such pair.
+
+    They survive torchvision's own NMS because that runs on axis-aligned
+    BOXES: two slightly different crops of one tilted spine do not overlap
+    enough as boxes to suppress each other, even though they are plainly the
+    same object. Which is §1's argument about AABBs arriving as duplicate
+    titles in a UI.
+
+    Suppressing on quad IoU instead is what §8א already does for scoring, so
+    this reuses `quad_iou` rather than approximating it. Same greedy shape as
+    `match_predictions`: keep the highest scorer, drop later overlaps.
+    Returns survivors in descending score order."""
+    order = score_order(predictions)
+    kept: list[int] = []
+
+    for index in order:
+        quad = predictions[index][0]
+        if any(quad_iou(quad, predictions[k][0]) >= iou_threshold for k in kept):
+            continue
+        kept.append(index)
+
+    return [predictions[k] for k in kept]
+
+
 def iou_matrix(
     predictions: list[tuple[list[Point], float]], ground_truth: list[list[Point]]
 ) -> np.ndarray:

@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from evaluate import (  # noqa: E402
     _summarize_stage_recall,
+    deduplicate_quads,
     average_precision,
     box_recall,
     evaluate,
@@ -404,6 +405,70 @@ class TestSummarizeStageRecall(unittest.TestCase):
         summary = _summarize_stage_recall([])
         self.assertEqual(summary["overall"]["n"], 0)
         self.assertAlmostEqual(summary["overall"]["proposals"], 0.0)
+
+
+class TestDeduplicateQuads(unittest.TestCase):
+    """Quad-IoU NMS over the FINAL detections.
+
+    Measured need, on a real phone photo of ~10 books: 12 detections came
+    back, three of them second copies of a book already found (the same
+    title cropped twice, at 0.99/0.98, 0.98/0.87, 0.98/0.52). Across 60 val
+    images, 16 had at least one such pair. torchvision's own NMS runs on
+    axis-aligned boxes, and two overlapping crops of one tilted spine do not
+    overlap enough AS BOXES to be suppressed -- which is section 1's argument
+    about AABBs, showing up as duplicate titles in a UI.
+
+    Deliberately the same greedy score-ranked shape as match_predictions:
+    keep the highest scorer, drop later ones that overlap it."""
+
+    def test_an_exact_duplicate_is_dropped_keeping_the_higher_score(self):
+        spine = _rect(0, 0, 30, 200)
+        kept = deduplicate_quads([(spine, 0.99), (spine, 0.52)], iou_threshold=0.5)
+        self.assertEqual(len(kept), 1)
+        self.assertAlmostEqual(kept[0][1], 0.99)
+
+    def test_distinct_neighbouring_spines_are_both_kept(self):
+        """The failure that would matter most: over-suppressing adjacent
+        books on a packed shelf, which is the whole task."""
+        left = _rect(0, 0, 30, 200)
+        right = _rect(32, 0, 30, 200)
+        kept = deduplicate_quads([(left, 0.99), (right, 0.98)], iou_threshold=0.5)
+        self.assertEqual(len(kept), 2)
+
+    def test_a_partial_overlap_below_the_threshold_survives(self):
+        a = _rect(0, 0, 30, 200)
+        b = _rect(20, 0, 30, 200)  # overlaps by a third
+        self.assertEqual(len(deduplicate_quads([(a, 0.9), (b, 0.8)], iou_threshold=0.8)), 2)
+
+    def test_ordering_of_the_input_does_not_matter(self):
+        spine = _rect(0, 0, 30, 200)
+        low_first = deduplicate_quads([(spine, 0.4), (spine, 0.95)], iou_threshold=0.5)
+        high_first = deduplicate_quads([(spine, 0.95), (spine, 0.4)], iou_threshold=0.5)
+        self.assertAlmostEqual(low_first[0][1], 0.95)
+        self.assertAlmostEqual(high_first[0][1], 0.95)
+
+    def test_output_stays_in_descending_score_order(self):
+        quads = [(_rect(i * 40, 0, 30, 200), 0.5 + i * 0.1) for i in range(4)]
+        kept = deduplicate_quads(quads, iou_threshold=0.5)
+        scores = [s for _, s in kept]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_three_copies_of_one_book_collapse_to_one(self):
+        """Exactly the observed case: 0.98 / 0.87 / 0.52 on one title."""
+        spine = _rect(10, 10, 30, 200)
+        nudged = _rect(11, 12, 30, 198)
+        kept = deduplicate_quads(
+            [(spine, 0.98), (nudged, 0.87), (spine, 0.52)], iou_threshold=0.5
+        )
+        self.assertEqual(len(kept), 1)
+        self.assertAlmostEqual(kept[0][1], 0.98)
+
+    def test_empty_input_is_empty_output(self):
+        self.assertEqual(deduplicate_quads([], iou_threshold=0.5), [])
+
+    def test_a_single_detection_is_untouched(self):
+        spine = _rect(0, 0, 30, 200)
+        self.assertEqual(len(deduplicate_quads([(spine, 0.9)], iou_threshold=0.5)), 1)
 
 
 if __name__ == "__main__":
