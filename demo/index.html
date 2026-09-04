@@ -58,6 +58,9 @@
   }
   .crop img { max-width: 100%; height: auto; border-radius: 4px; flex: 1; }
   .score { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 44px; }
+  .advanced { margin-bottom: 10px; color: var(--muted); font-size: 13px; }
+  .advanced summary { cursor: pointer; }
+  .advanced input { margin-top: 8px; width: 100%; }
 </style>
 </head>
 <body>
@@ -65,10 +68,10 @@
 <h1>Bookshelf detector</h1>
 <div class="sub">מעלה תמונה של מדף, מסמן כל שדרה, ומחזיר אותה חתוכה ומיושרת — מוכנה לקריאה.</div>
 
-<div class="row">
-  <label for="url">כתובת השרת</label>
+<details class="advanced">
+  <summary>כתובת השרת (מזוהה אוטומטית)</summary>
   <input type="text" id="url" placeholder="https://xxx.trycloudflare.com">
-</div>
+</details>
 <div class="row">
   <label for="maxside">הקטנה לפני שליחה (פיקסלים)</label>
   <input type="number" id="maxside" value="2040" min="800" max="6000" step="100">
@@ -87,9 +90,14 @@
 const $ = id => document.getElementById(id);
 let chosenFile = null;
 
-// Remember the tunnel URL between reloads -- it changes on every restart of
-// `cloudflared`, and retyping it during a demo is exactly when it gets typo'd.
-$("url").value = localStorage.getItem("detectorUrl") || "";
+// The page is served BY the detector, so its own origin is the right answer
+// and there is nothing to type. Asking for the URL here was a design bug:
+// the one value the page always knows is the one it was demanding.
+// The field stays, greyed, only so a page opened from disk can still point
+// at a running server.
+$("url").value = location.protocol.startsWith("http")
+  ? location.origin
+  : (localStorage.getItem("detectorUrl") || "");
 $("url").addEventListener("change", () => localStorage.setItem("detectorUrl", $("url").value.trim()));
 
 $("file").addEventListener("change", e => {
