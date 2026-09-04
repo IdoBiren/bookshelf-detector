@@ -66,10 +66,39 @@ def quad_iou(quad_a: list[Point], quad_b: list[Point]) -> float:
     return int((mask_a & mask_b).sum()) / union
 
 
+def iou_matrix(
+    predictions: list[tuple[list[Point], float]], ground_truth: list[list[Point]]
+) -> np.ndarray:
+    """Every (prediction, ground-truth) IoU for one image, as a P x G array
+    indexed by INPUT order.
+
+    Exists because `evaluate` sweeps ten IoU thresholds and then walks three
+    width bands, and quad_iou rasterizes two polygons on every call -- so
+    without this the same pair is rasterized fourteen times over. That was
+    affordable only while a 0.5 score threshold was keeping the prediction
+    count down, which is exactly the thing we need to stop doing."""
+    matrix = np.zeros((len(predictions), len(ground_truth)), dtype=np.float64)
+    for i, (quad, _score) in enumerate(predictions):
+        for j, gt_quad in enumerate(ground_truth):
+            matrix[i, j] = quad_iou(quad, gt_quad)
+    return matrix
+
+
+def score_order(predictions: list[tuple[list[Point], float]]) -> list[int]:
+    """Indices of `predictions` from highest score to lowest.
+
+    Callers that pair a `match_predictions` result back up with the
+    predictions it came from need this, because the flags come back in score
+    order while a cached IoU matrix is indexed by input order. Stable, so
+    equal scores keep their input order."""
+    return sorted(range(len(predictions)), key=lambda i: predictions[i][1], reverse=True)
+
+
 def match_predictions(
     predictions: list[tuple[list[Point], float]],
     ground_truth: list[list[Point]],
     iou_threshold: float,
+    ious: np.ndarray | None = None,
 ) -> tuple[list[bool], int]:
     """Greedy score-ranked matching, COCO-style.
 
@@ -77,17 +106,25 @@ def match_predictions(
     count). Each ground-truth object can be claimed only once — without
     that, a model that fires ten overlapping boxes per spine would score
     perfectly, and merge/split behaviour would be invisible.
+
+    `ious` is an optional precomputed P x G matrix from `iou_matrix`,
+    indexed by the INPUT order of `predictions` (not score order). Passing
+    it changes nothing about the result — there is a test pinning that at
+    every threshold — it only avoids re-rasterizing the same polygon pairs
+    once per threshold.
     """
-    ranked = sorted(predictions, key=lambda pair: pair[1], reverse=True)
+    if ious is None:
+        ious = iou_matrix(predictions, ground_truth)
+
     claimed = [False] * len(ground_truth)
     flags: list[bool] = []
 
-    for quad, _score in ranked:
+    for prediction_index in score_order(predictions):
         best_iou, best_index = 0.0, -1
-        for index, gt_quad in enumerate(ground_truth):
+        for index in range(len(ground_truth)):
             if claimed[index]:
                 continue
-            iou = quad_iou(quad, gt_quad)
+            iou = float(ious[prediction_index, index])
             if iou > best_iou:
                 best_iou, best_index = iou, index
 
@@ -163,18 +200,38 @@ def evaluate(
 
     results: dict = {"by_iou": {}, "by_width": {}}
 
+    # Rasterize every (prediction, ground-truth) pair ONCE. The threshold
+    # sweep and all three width bands then read from these matrices.
+    cached = [
+        (predictions, ground_truth, iou_matrix(predictions, ground_truth))
+        for predictions, ground_truth in per_image
+    ]
+
     ap_per_threshold = []
     for threshold in IOU_THRESHOLDS:
-        flags, scores, total_gt = [], [], 0
-        for predictions, ground_truth in per_image:
-            image_flags, _ = match_predictions(predictions, ground_truth, threshold)
+        flags, scores, total_gt, matched_gt = [], [], 0, 0
+        for predictions, ground_truth, ious in cached:
+            image_flags, matched = match_predictions(
+                predictions, ground_truth, threshold, ious=ious
+            )
             ranked_scores = sorted((s for _, s in predictions), reverse=True)
             flags.extend(image_flags)
             scores.extend(ranked_scores)
             total_gt += len(ground_truth)
+            matched_gt += matched
         ap = average_precision(flags, scores, total_gt)
         ap_per_threshold.append(ap)
         results["by_iou"][f"AP@{threshold:.2f}"] = ap
+
+        if threshold == IOU_THRESHOLDS[0]:
+            # Recall at IoU 0.50, reported because AP alone cannot tell
+            # "the model never produced this detection" apart from "we
+            # filtered it out before scoring": average_precision divides by
+            # the full ground-truth count, so a dropped detection caps
+            # recall and every recall point above the cap contributes 0.0.
+            # A low mAP with high recall is a precision problem; a low mAP
+            # with low recall is a detections problem. Different fixes.
+            results["recall@50"] = matched_gt / total_gt if total_gt else 0.0
 
     results["mAP@50"] = ap_per_threshold[0]
     results["mAP@50:95"] = float(np.mean(ap_per_threshold))
@@ -187,26 +244,32 @@ def evaluate(
     # punished when scoring the thin band, and a perfect predictor scores
     # ~0.43 per band instead of 1.0. There is a test pinning exactly that.
     for band in ("thin", "medium", "wide"):
-        flags, scores, total_gt = [], [], 0
-        for predictions, ground_truth in per_image:
-            band_gt = [gt for gt in ground_truth if bucket(gt) == band]
-            other_gt = [gt for gt in ground_truth if bucket(gt) != band]
-            if not band_gt:
+        flags, scores, total_gt, matched_gt = [], [], 0, 0
+        for predictions, ground_truth, ious in cached:
+            band_columns = [j for j, gt in enumerate(ground_truth) if bucket(gt) == band]
+            other_columns = [j for j, gt in enumerate(ground_truth) if bucket(gt) != band]
+            if not band_columns:
                 continue
 
-            ranked = sorted(predictions, key=lambda pair: pair[1], reverse=True)
-            image_flags, _ = match_predictions(ranked, band_gt, IOU_THRESHOLDS[0])
+            band_gt = [ground_truth[j] for j in band_columns]
+            image_flags, matched = match_predictions(
+                predictions, band_gt, IOU_THRESHOLDS[0], ious=ious[:, band_columns]
+            )
 
-            for (quad, score), is_true_positive in zip(ranked, image_flags):
-                if not is_true_positive and other_gt:
-                    if max(quad_iou(quad, gt) for gt in other_gt) >= IOU_THRESHOLDS[0]:
+            for position, prediction_index in enumerate(score_order(predictions)):
+                is_true_positive = image_flags[position]
+                if not is_true_positive and other_columns:
+                    out_of_band = max(float(ious[prediction_index, j]) for j in other_columns)
+                    if out_of_band >= IOU_THRESHOLDS[0]:
                         continue  # belongs to another band -- neither TP nor FP here
                 flags.append(is_true_positive)
-                scores.append(score)
+                scores.append(predictions[prediction_index][1])
             total_gt += len(band_gt)
+            matched_gt += matched
 
         results["by_width"][band] = {
             "AP@50": average_precision(flags, scores, total_gt),
+            "recall@50": matched_gt / total_gt if total_gt else 0.0,
             "ground_truth": total_gt,
         }
 
@@ -220,6 +283,7 @@ def evaluate_checkpoint(
     images_dir: str,
     score_threshold: float = 0.5,
     limit: int | None = None,
+    log_every: int = 10,
 ) -> dict:
     """Loads a trained checkpoint, runs it over a COCO split, and returns
     §8א's numbers. Ground truth quads come from the SAME mask_to_quad path
@@ -248,23 +312,42 @@ def evaluate_checkpoint(
     from model import build_model
     from train import load_checkpoint
 
+    # Same selection as train.py: eval was running Mask R-CNN on the CPU
+    # while the GPU that just did the training sat idle, which is most of
+    # why a 147-image run looked like a hang.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device: {device}")
+
     model = build_model(pretrained=False)
+    # Load onto the CPU first, then move -- load_checkpoint maps to CPU, and
+    # this order never holds two copies of the weights on the GPU.
     load_checkpoint(Path(checkpoint), model)
+    model.to(device)
     model.eval()
 
     dataset = SpineDataset(Path(coco_path), Path(images_dir))
     if limit:
         dataset.entries = dataset.entries[:limit]
 
+    # Same reason train.py prints its batch count (d727acc): a slow run and
+    # a hung run are indistinguishable from silence, and this loop used to
+    # print nothing at all until it was completely finished.
+    print(f"evaluating {len(dataset)} images  (a line every {log_every})")
+    print(f"score threshold: {score_threshold}")
+
     per_image = []
     for index in range(len(dataset)):
         image, target = dataset[index]
         with torch.no_grad():
-            output = model([image])[0]
+            output = model([image.to(device)])[0]
 
         keep = output["scores"] >= score_threshold
         predictions = []
-        for mask, score in zip(output["masks"][keep].numpy(), output["scores"][keep].tolist()):
+        # .cpu() before .numpy(): on CUDA the bare .numpy() raises
+        # "can't convert cuda:0 device type tensor to numpy". target["masks"]
+        # below needs no such thing -- ground truth never leaves the CPU.
+        masks = output["masks"][keep].cpu().numpy()
+        for mask, score in zip(masks, output["scores"][keep].tolist()):
             quad = mask_to_quad(mask[0])
             if quad is not None:
                 predictions.append((quad, score))
@@ -276,6 +359,17 @@ def evaluate_checkpoint(
         ]
         per_image.append((predictions, ground_truth))
 
+        if index % log_every == 0:
+            # detections vs gt is the live version of the recall question:
+            # detections sitting far below gt on dense shelves is the
+            # suppression this eval exists to measure.
+            print(
+                f"  image {index:>4}/{len(dataset)}"
+                f"  detections={len(predictions):>3}  gt={len(ground_truth):>3}",
+                flush=True,
+            )
+
+    print("matching and integrating AP...", flush=True)
     return evaluate(per_image)
 
 
@@ -287,26 +381,44 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--coco", default=str(repo_root / "data" / "merged" / "pretrain_val.json"))
     parser.add_argument("--images-dir", default=str(repo_root / "data" / "merged" / "images"))
-    parser.add_argument("--score-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--score-threshold", type=float, default=0.5,
+        help="Drop detections below this score BEFORE scoring. This caps recall "
+             "and therefore caps AP -- COCO applies no such filter, because "
+             "ranking by score IS the threshold sweep. Use 0.05 (the model's own "
+             "box_score_thresh) for a comparable mAP; the 0.5 default is kept "
+             "only so earlier numbers stay reproducible.",
+    )
+    parser.add_argument("--log-every", type=int, default=10,
+                        help="Print a progress line every N images.")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--report", default=None)
     args = parser.parse_args()
 
     results = evaluate_checkpoint(
-        args.checkpoint, args.coco, args.images_dir, args.score_threshold, args.limit
+        args.checkpoint, args.coco, args.images_dir, args.score_threshold,
+        args.limit, args.log_every,
     )
 
     print("=== §8א geometric evaluation (quad IoU, not AABB) ===")
     print(f"mAP@50    : {results['mAP@50']:.4f}")
     print(f"mAP@50:95 : {results['mAP@50:95']:.4f}")
+    print(f"recall@50 : {results['recall@50']:.4f}")
+    print(f"  (at score threshold {args.score_threshold} -- AP cannot exceed recall,")
+    print("   so a low mAP with high recall is a precision problem and a low mAP")
+    print("   with low recall is a missing-detections problem)")
     print("\nby spine-width tercile (trap #4 -- a good overall mAP can hide this):")
     edges = results["width_tercile_edges"]
-    print(f"  thin   (<= {edges['thin_max']:.1f}px) AP@50={results['by_width']['thin']['AP@50']:.4f}"
-          f"  n={results['by_width']['thin']['ground_truth']}")
-    print(f"  medium (<= {edges['medium_max']:.1f}px) AP@50={results['by_width']['medium']['AP@50']:.4f}"
-          f"  n={results['by_width']['medium']['ground_truth']}")
-    print(f"  wide            AP@50={results['by_width']['wide']['AP@50']:.4f}"
-          f"  n={results['by_width']['wide']['ground_truth']}")
+    labels = {
+        "thin": f"thin   (<= {edges['thin_max']:.1f}px)",
+        "medium": f"medium (<= {edges['medium_max']:.1f}px)",
+        "wide": "wide             ",
+    }
+    for band, label in labels.items():
+        band_results = results["by_width"][band]
+        print(f"  {label} AP@50={band_results['AP@50']:.4f}"
+              f"  recall@50={band_results['recall@50']:.4f}"
+              f"  n={band_results['ground_truth']}")
 
     if args.report:
         import json

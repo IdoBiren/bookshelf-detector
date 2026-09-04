@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from evaluate import (  # noqa: E402
     average_precision,
     evaluate,
+    iou_matrix,
     match_predictions,
     quad_iou,
     spine_width,
@@ -202,6 +203,113 @@ class TestEvaluateEndToEnd(unittest.TestCase):
         self.assertAlmostEqual(results["by_width"]["thin"]["AP@50"], 0.0, places=3)
         self.assertGreater(results["by_width"]["medium"]["AP@50"], 0.9)
         self.assertGreater(results["by_width"]["wide"]["AP@50"], 0.9)
+
+
+class TestRecall(unittest.TestCase):
+    """Recall is the number that tells NMS suppression apart from a
+    truncated PR curve, and it was being computed and thrown away.
+
+    AP alone cannot make that distinction: `average_precision` divides by
+    the FULL ground-truth count, so any detection dropped before scoring
+    caps recall, and every recall point above the cap contributes 0.0 to
+    the 101-point mean. A low AP is therefore consistent with both "the
+    model never produced the detection" and "we filtered it out
+    ourselves". Recall separates them."""
+
+    def test_perfect_predictions_recall_everything(self):
+        gts = [_rect(0, 0, 10, 100), _rect(20, 0, 30, 100), _rect(60, 0, 50, 100)]
+        results = evaluate([([(gt, 1.0) for gt in gts], gts)])
+        self.assertAlmostEqual(results["recall@50"], 1.0, places=6)
+
+    def test_detecting_half_the_ground_truth_gives_half_the_recall(self):
+        found = _rect(0, 0, 30, 100)
+        missed = _rect(60, 0, 30, 100)
+        results = evaluate([([(found, 0.9)], [found, missed])])
+        self.assertAlmostEqual(results["recall@50"], 0.5, places=6)
+
+    def test_no_predictions_gives_zero_recall_and_does_not_crash(self):
+        results = evaluate([([], [_rect(0, 0, 30, 100)])])
+        self.assertAlmostEqual(results["recall@50"], 0.0, places=6)
+
+    def test_no_ground_truth_gives_zero_recall_and_does_not_divide_by_zero(self):
+        results = evaluate([([], [])])
+        self.assertAlmostEqual(results["recall@50"], 0.0, places=6)
+
+    def test_recall_is_reported_per_width_band_too(self):
+        """Trap #4 applies to recall exactly as it does to AP: overall
+        recall can look respectable while the thin band is being lost."""
+        thin = _rect(0, 0, 8, 100)
+        medium = _rect(20, 0, 30, 100)
+        wide = _rect(60, 0, 60, 100)
+        predictions = [(medium, 0.9), (wide, 0.9)]  # thin one never detected
+
+        results = evaluate([(predictions, [thin, medium, wide])])
+        self.assertAlmostEqual(results["by_width"]["thin"]["recall@50"], 0.0, places=6)
+        self.assertAlmostEqual(results["by_width"]["medium"]["recall@50"], 1.0, places=6)
+        self.assertAlmostEqual(results["by_width"]["wide"]["recall@50"], 1.0, places=6)
+
+    def test_a_duplicate_detection_does_not_inflate_recall_past_one(self):
+        """One ground-truth object can only be claimed once, so ten
+        overlapping detections of the same spine still recall one spine."""
+        spine = _rect(0, 0, 30, 100)
+        predictions = [(spine, 0.9 - i * 0.01) for i in range(10)]
+        results = evaluate([(predictions, [spine])])
+        self.assertAlmostEqual(results["recall@50"], 1.0, places=6)
+
+
+class TestIouMatrixCache(unittest.TestCase):
+    """`evaluate` sweeps 10 IoU thresholds, and every threshold used to
+    re-rasterize the same polygon pairs from scratch -- quad_iou computed
+    10x per (prediction, ground-truth) pair, plus again per width band.
+    That cost is what made running without a score threshold impractical,
+    and dropping the score threshold is the whole experiment.
+
+    Caching is only worth doing if it is invisible, so that is what these
+    tests pin."""
+
+    def _fixture(self):
+        ground_truth = [_rect(0, 0, 20, 100), _rect(25, 0, 30, 100), _rect(60, 0, 45, 100)]
+        predictions = [
+            (_rect(0, 0, 20, 100), 0.95),      # exact
+            (_rect(26, 2, 30, 96), 0.80),      # near miss on the second
+            (_rect(58, 0, 50, 100), 0.60),     # loose on the third
+            (_rect(200, 200, 30, 100), 0.40),  # nothing at all
+        ]
+        return predictions, ground_truth
+
+    def test_matrix_entries_equal_quad_iou_called_directly(self):
+        predictions, ground_truth = self._fixture()
+        matrix = iou_matrix(predictions, ground_truth)
+        self.assertEqual(matrix.shape, (len(predictions), len(ground_truth)))
+        for i, (quad, _score) in enumerate(predictions):
+            for j, gt_quad in enumerate(ground_truth):
+                self.assertAlmostEqual(matrix[i][j], quad_iou(quad, gt_quad), places=12)
+
+    def test_precomputed_ious_give_identical_matches_at_every_threshold(self):
+        predictions, ground_truth = self._fixture()
+        matrix = iou_matrix(predictions, ground_truth)
+        for threshold in [round(0.5 + 0.05 * i, 2) for i in range(10)]:
+            fresh = match_predictions(predictions, ground_truth, threshold)
+            cached = match_predictions(predictions, ground_truth, threshold, ious=matrix)
+            self.assertEqual(fresh, cached, msg=f"diverged at IoU {threshold}")
+
+    def test_flags_stay_in_score_order_not_input_order(self):
+        """match_predictions documents that its flags come back in score
+        order. The cache indexes rows by INPUT order, so getting this wrong
+        silently pairs flags with the wrong scores in average_precision."""
+        hit = _rect(0, 0, 30, 100)
+        miss = _rect(500, 500, 30, 100)
+        # Lowest score first on purpose, so input order != score order.
+        predictions = [(miss, 0.10), (hit, 0.99)]
+        flags, matched = match_predictions(predictions, [hit], 0.5)
+        self.assertEqual(flags, [True, False])
+        self.assertEqual(matched, 1)
+
+    def test_empty_inputs_produce_correctly_shaped_matrices(self):
+        gt = [_rect(0, 0, 30, 100)]
+        self.assertEqual(iou_matrix([], gt).shape, (0, 1))
+        self.assertEqual(iou_matrix([(gt[0], 1.0)], []).shape, (1, 0))
+        self.assertEqual(iou_matrix([], []).shape, (0, 0))
 
 
 if __name__ == "__main__":
