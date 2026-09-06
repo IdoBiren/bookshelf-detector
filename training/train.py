@@ -176,11 +176,14 @@ def main(
     log_every: int = 20,
     mask_resolution: int = 14,
     init_from: str | None = None,
+    augment: bool = False,
+    augment_seed: int | None = None,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 
-    dataset = SpineDataset(Path(coco_train), Path(images_dir))
+    dataset = SpineDataset(Path(coco_train), Path(images_dir), augment=augment, augment_seed=augment_seed)
+    print(f"augment: {augment}" + (f"  (seed={augment_seed})" if augment else ""))
     if limit:
         # Stage 5's overfit check (plan §9): a handful of images, loss -> ~0.
         dataset.entries = dataset.entries[:limit]
@@ -272,6 +275,23 @@ if __name__ == "__main__":
              "across a different --mask-resolution than that checkpoint was saved "
              "with (mask_head/mask_predictor weight shapes don't depend on it).",
     )
+    parser.add_argument(
+        "--augment", action="store_true",
+        help="Apply augment.py's geometric+photometric pipeline (rotation, "
+             "perspective, scale, crop, brightness/contrast/hue, blur, noise, "
+             "JPEG compression) during training. Off by default -- existing runs "
+             "are unaffected unless this is passed. No vertical flip or 90/180 "
+             "rotation: those would break the spine-is-roughly-vertical prior the "
+             "geometry pipeline depends on (horizontal flip IS included -- it "
+             "preserves verticality). Forces every image to augment.py's fixed "
+             "640x640 crop size, a departure from the unaugmented path's original "
+             "image size.",
+    )
+    parser.add_argument(
+        "--augment-seed", type=int, default=None,
+        help="Seed the augmentation pipeline for a reproducible run. None means "
+             "a fresh, unseeded pipeline (different every run, including resumes).",
+    )
     args = parser.parse_args()
 
     main(
@@ -286,4 +306,6 @@ if __name__ == "__main__":
         log_every=args.log_every,
         mask_resolution=args.mask_resolution,
         init_from=args.init_from,
+        augment=args.augment,
+        augment_seed=args.augment_seed,
     )

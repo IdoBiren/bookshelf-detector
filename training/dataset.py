@@ -11,10 +11,12 @@ COCO stores bbox as [x, y, w, h] while torchvision wants [x1, y1, x2, y2],
 and every polygon has to become its own filled mask — an all-zero mask
 trains happily and teaches nothing.
 
-Augmentation is deliberately NOT applied here yet. augment.py's pipeline
-carries polygons through as keypoints; wiring it in means re-rasterizing
-masks from the transformed polygons, which is a separate change with its
-own failure modes. The quality-ceiling run comes first.
+Augmentation (`augment.py`'s pipeline, carrying polygons through as
+keypoints) is wired in behind `augment=False` by default, so every existing
+call site is unaffected unless it opts in. When it runs, masks are
+RE-RASTERIZED from the transformed polygons rather than warping the mask
+images directly -- the same reasoning as the unaugmented path: a polygon is
+the source of truth, and the mask is derived from it.
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ import numpy as np
 import torch
 from PIL import Image
 
+from augment import build_augmentation_pipeline, flatten_polygons_to_keypoints, regroup_keypoints_to_polygons
+
 # rasterize_polygon lives in dbnet_targets.py but is generic raster geometry,
 # not DBNet-specific -- reused rather than duplicated, on the same reasoning
 # that write_merged_dataset is shared between the two dataset builders.
@@ -36,9 +40,22 @@ MIN_MASK_PIXELS = 4
 
 
 class SpineDataset(torch.utils.data.Dataset):
-    def __init__(self, coco_path: Path, images_dir: Path):
+    def __init__(
+        self,
+        coco_path: Path,
+        images_dir: Path,
+        augment: bool = False,
+        augment_seed: int | None = None,
+    ):
         self.images_dir = Path(images_dir)
         self.stats: dict[str, int] = {"missing_image_file": 0, "degenerate_annotation": 0}
+        # One pipeline instance per dataset, not per __getitem__ call: an
+        # Albumentations Compose seeded once at construction gives a
+        # reproducible SEQUENCE of augmentations across an epoch, not an
+        # identical result on every call -- which is what "same seed,
+        # reproducible run" is supposed to mean. None when augment=False, so
+        # the unaugmented path below never touches augment.py at all.
+        self._augment_pipeline = build_augmentation_pipeline(seed=augment_seed) if augment else None
 
         with Path(coco_path).open(encoding="utf-8") as f:
             coco = json.load(f)
@@ -74,13 +91,30 @@ class SpineDataset(torch.utils.data.Dataset):
         path = self.images_dir / entry["file_name"]
 
         with Image.open(path) as pil_image:
-            array = np.asarray(pil_image.convert("RGB"), dtype=np.float32) / 255.0
-        image = torch.from_numpy(array).permute(2, 0, 1)  # HWC -> CHW
+            array = np.asarray(pil_image.convert("RGB"))  # uint8 HWC
+
+        polygons = entry["polygons"]
+
+        if self._augment_pipeline is not None:
+            # Flatten every polygon into one keypoints list (variable vertex
+            # counts per annotation -- see augment.py), transform, regroup.
+            # Any resulting polygon (e.g. cropped fully out of frame) that
+            # rasterizes to nothing is caught by the SAME degenerate-mask
+            # check below that already handles the unaugmented path -- no
+            # separate "did the crop miss this spine" logic needed.
+            annotations = [{"segmentation": [coords]} for coords in polygons]
+            keypoints, vertex_counts = flatten_polygons_to_keypoints(annotations)
+            transformed = self._augment_pipeline(image=array, keypoints=keypoints)
+            array = transformed["image"]
+            regrouped = regroup_keypoints_to_polygons(transformed["keypoints"], vertex_counts)
+            polygons = [[coordinate for point in polygon for coordinate in point] for polygon in regrouped]
+
+        image = torch.from_numpy(array.astype(np.float32) / 255.0).permute(2, 0, 1)  # HWC -> CHW
 
         height, width = image.shape[1], image.shape[2]
 
         masks, boxes = [], []
-        for coords in entry["polygons"]:
+        for coords in polygons:
             points = list(zip(coords[0::2], coords[1::2]))
             mask = rasterize_polygon(points, width, height)
             if int(mask.sum()) < MIN_MASK_PIXELS:

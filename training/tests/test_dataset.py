@@ -169,6 +169,102 @@ class TestSpineDataset(unittest.TestCase):
             self.assertEqual(dataset.stats["degenerate_annotation"], 1)
 
 
+class TestAugmentation(unittest.TestCase):
+    """augment.py's pipeline existed standalone, tested but never wired in
+    (dataset.py's own docstring said so explicitly) -- these pin the wiring.
+
+    The pipeline's RandomCrop always outputs TARGET_SIZE (640x640,
+    augment.py's own constant), which is the simplest observable proof that
+    it actually ran: an unaugmented image stays at its original size."""
+
+    def test_default_is_unaugmented_original_size(self):
+        """Backward compatibility: every existing call site omits `augment`
+        and must see byte-for-byte the same behavior as before this change."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            coco = _write_dataset(tmpdir, [[_square(10, 10, 50, 60)]])
+            dataset = SpineDataset(coco, tmpdir / "images")
+            image, _ = dataset[0]
+            self.assertEqual(tuple(image.shape[1:]), (150, 200))  # original H, W
+
+    def test_augment_true_produces_the_pipelines_target_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            coco = _write_dataset(tmpdir, [[_square(10, 10, 50, 60)]])
+            dataset = SpineDataset(coco, tmpdir / "images", augment=True, augment_seed=0)
+            image, _ = dataset[0]
+            self.assertEqual(tuple(image.shape[1:]), (640, 640))
+
+    def test_augmented_image_keeps_the_same_tensor_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            coco = _write_dataset(tmpdir, [[_square(10, 10, 50, 60)]])
+            dataset = SpineDataset(coco, tmpdir / "images", augment=True, augment_seed=0)
+            image, target = dataset[0]
+
+            self.assertEqual(image.dtype, torch.float32)
+            self.assertEqual(image.shape[0], 3)
+            self.assertGreaterEqual(float(image.min()), 0.0)
+            self.assertLessEqual(float(image.max()), 1.0)
+            self.assertEqual(target["boxes"].dtype, torch.float32)
+            self.assertEqual(target["labels"].dtype, torch.int64)
+            self.assertEqual(target["masks"].dtype, torch.uint8)
+
+    def test_same_seed_is_reproducible_across_dataset_instances(self):
+        """Mirrors test_augment.py's own reproducibility test, one level up:
+        two DATASETS built with the same seed must agree, not just two calls
+        to the same pipeline object."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            coco = _write_dataset(tmpdir, [[_square(10, 10, 50, 60)]])
+            a = SpineDataset(coco, tmpdir / "images", augment=True, augment_seed=123)
+            b = SpineDataset(coco, tmpdir / "images", augment=True, augment_seed=123)
+            image_a, target_a = a[0]
+            image_b, target_b = b[0]
+
+            self.assertTrue(torch.equal(image_a, image_b))
+            self.assertTrue(torch.equal(target_a["boxes"], target_b["boxes"]))
+
+    def test_a_polygon_cropped_entirely_out_of_frame_is_dropped_not_crashed(self):
+        """RandomCrop can legitimately push a spine fully outside the 640x640
+        window. The existing degenerate-annotation path (mask.sum() too
+        small) must catch this without new logic -- proving the augmented
+        path reuses the same mask/box validation as the unaugmented one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            # A large image with one tiny spine in a far corner -- across a
+            # handful of seeds at least one RandomCrop should miss it
+            # entirely, and none of them should raise.
+            images_dir = tmpdir / "images"
+            images_dir.mkdir()
+            Image.new("RGB", (2000, 2000), (128, 128, 128)).save(images_dir / "img1.jpg")
+            coco_path = tmpdir / "data.json"
+            polygon = _square(5, 5, 20, 30)
+            xs, ys = polygon[0::2], polygon[1::2]
+            coco_path.write_text(
+                json.dumps(
+                    {
+                        "images": [{"id": 1, "file_name": "img1.jpg", "width": 2000, "height": 2000}],
+                        "annotations": [
+                            {
+                                "id": 1, "image_id": 1, "category_id": 1,
+                                "segmentation": [polygon],
+                                "bbox": [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)],
+                                "area": 1.0, "iscrowd": 0,
+                            }
+                        ],
+                        "categories": [{"id": 1, "name": "spine"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            for seed in range(5):
+                dataset = SpineDataset(coco_path, images_dir, augment=True, augment_seed=seed)
+                image, target = dataset[0]  # must not raise regardless of outcome
+                self.assertEqual(tuple(image.shape[1:]), (640, 640))
+                self.assertLessEqual(target["masks"].shape[0], 1)
+
+
 class TestCollateFn(unittest.TestCase):
     def test_keeps_images_as_a_list_rather_than_stacking_them(self):
         """Detection models take a LIST of images of differing sizes --
