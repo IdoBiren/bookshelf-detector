@@ -161,6 +161,99 @@ class TestMaskResolution(unittest.TestCase):
         self.assertEqual(model.roi_heads.mask_roi_pool.output_size, (14, 14))
 
 
+class TestTrainableBackboneLayers(unittest.TestCase):
+    """Pins a real bug, found by reproducing an actual Colab crash:
+    `ValueError: loaded state dict contains a parameter group that doesn't
+    match the size of optimizer's group` when resuming
+    `--init-from`-created checkpoint with a plain `--checkpoint-dir` resume.
+
+    Root cause, confirmed live (one network call, not repeated here):
+    torchvision's `maskrcnn_resnet50_fpn` calls `_validate_trainable_layers`,
+    which -- when `weights_backbone` is `None` (this project's
+    `pretrained=False`) -- **ignores whatever `trainable_backbone_layers`
+    value is passed and forces all 5 backbone stages trainable** (with a
+    `UserWarning`), including `conv1`/`bn1`/`layer1`. When
+    `weights_backbone` IS set (`pretrained=True`), the value passed (or
+    torchvision's own default of 3) is honored, training only
+    `layer2`/`layer3`/`layer4`.
+
+    train.py's `--init-from` path builds with `pretrained=False` (so as not
+    to download COCO weights that `load_model_weights_only` immediately
+    overwrites) -> forced to 5 trainable stages, unconditionally. A later
+    plain resume (no `--init-from`) built with `pretrained=True` -> only 3
+    -> a SMALLER optimizer parameter set than the one being loaded -> crash.
+
+    The fix is not "pass trainable_backbone_layers explicitly" (torchvision
+    ignores it whenever `pretrained=False`, as pinned below) -- it is that
+    `main()` must set `pretrained=True` ONLY on a genuinely fresh run (no
+    `--init-from` AND no existing checkpoint to resume), so that
+    `--init-from` and every later resume of it agree on `pretrained=False`
+    and therefore on all-5-trainable, unconditionally. That fix lives in
+    `main()`'s own wiring, which -- like `--mask-resolution`/`--init-from`
+    before it -- is verified by a real run rather than a unit test. These
+    tests pin the mechanism the fix relies on, offline."""
+
+    @staticmethod
+    def _trainable_backbone_param_names(model):
+        return {name for name, p in model.backbone.body.named_parameters() if p.requires_grad}
+
+    def test_pretrained_false_forces_all_backbone_layers_trainable(self):
+        """The actual torchvision behavior the bug hinges on: an explicit
+        trainable_backbone_layers is IGNORED whenever weights_backbone is
+        None. If a future torchvision version stops doing this, this test
+        fails and the fix in main() needs re-examining."""
+        few_requested = self._trainable_backbone_param_names(
+            build_model(pretrained=False, trainable_backbone_layers=3)
+        )
+        many_requested = self._trainable_backbone_param_names(
+            build_model(pretrained=False, trainable_backbone_layers=5)
+        )
+        self.assertEqual(few_requested, many_requested)
+        self.assertIn("conv1.weight", many_requested)
+
+    def test_two_pretrained_false_builds_have_optimizer_compatible_parameter_sets(self):
+        """The actual invariant the fix in main() relies on: as long as
+        BOTH the checkpoint that was saved and the model resuming it were
+        built with pretrained=False, their optimizers are compatible --
+        regardless of whatever trainable_backbone_layers value either call
+        happened to pass, since it is ignored either way."""
+        saved = build_model(pretrained=False, trainable_backbone_layers=None)
+        saved_optimizer = torch.optim.SGD(
+            [p for p in saved.parameters() if p.requires_grad], lr=0.001
+        )
+
+        resumed = build_model(pretrained=False, trainable_backbone_layers=3)
+        resumed_optimizer = torch.optim.SGD(
+            [p for p in resumed.parameters() if p.requires_grad], lr=0.001
+        )
+        resumed_optimizer.load_state_dict(saved_optimizer.state_dict())  # must not raise
+
+    def test_a_smaller_trainable_set_fails_to_resume_a_larger_ones_optimizer(self):
+        """The crash itself, reproduced offline without needing
+        pretrained=True's network download: simulates what a
+        fewer-trainable-layers build looks like by freezing the same
+        parameters torchvision's pretrained=True/trainable_backbone_layers=3
+        path freezes (conv1, bn1, layer1 -- confirmed live, see class
+        docstring), so this pins the general failure mode -- an optimizer
+        resume needs a matching trainable parameter SET -- that the real bug
+        was one instance of."""
+        full = build_model(pretrained=False)
+        full_optimizer = torch.optim.SGD(
+            [p for p in full.parameters() if p.requires_grad], lr=0.001
+        )
+
+        partial = build_model(pretrained=False)
+        for name, p in partial.backbone.body.named_parameters():
+            if name.split(".")[0] in ("conv1", "bn1", "layer1"):
+                p.requires_grad_(False)
+        partial_optimizer = torch.optim.SGD(
+            [p for p in partial.parameters() if p.requires_grad], lr=0.001
+        )
+
+        with self.assertRaises(ValueError):
+            partial_optimizer.load_state_dict(full_optimizer.state_dict())
+
+
 class TestDescribeModel(unittest.TestCase):
     def test_reports_a_plausible_parameter_count(self):
         model = build_model(pretrained=False)

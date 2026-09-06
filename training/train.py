@@ -202,10 +202,28 @@ def main(
         collate_fn=collate_fn,
     )
 
-    # pretrained=False when warm-starting: init_from's state_dict overwrites
-    # the whole model anyway, so downloading ~170MB of COCO weights first
-    # just to discard them is wasted bandwidth.
-    model = build_model(pretrained=init_from is None, mask_resolution=mask_resolution)
+    # Checked BEFORE building the model: whether THIS run is a genuinely
+    # fresh start decides `pretrained`, and that decision has to be made
+    # with knowledge of whether a checkpoint is about to be loaded onto it.
+    latest = find_latest_checkpoint(Path(checkpoint_dir))
+    starting_fresh = init_from is None and latest is None
+
+    # pretrained=False whenever a checkpoint is about to be loaded (either
+    # --init-from or a resume) -- downloading ~170MB of COCO weights first,
+    # just to have load_checkpoint/load_model_weights_only overwrite them,
+    # is wasted bandwidth. This also fixes a real crash: torchvision's
+    # maskrcnn_resnet50_fpn forces ALL FIVE backbone stages trainable
+    # whenever weights_backbone is None (pretrained=False here), regardless
+    # of any trainable_backbone_layers value passed -- but only THREE when
+    # pretrained=True. An --init-from run (pretrained=False, 5 trainable
+    # stages) followed by a plain resume that used to compute
+    # pretrained=True (3 stages) built a SMALLER optimizer than the one
+    # being loaded, and optimizer.load_state_dict raised "parameter group
+    # that doesn't match the size of optimizer's group". Keying `pretrained`
+    # off `starting_fresh` instead means --init-from and every later resume
+    # of it agree on pretrained=False -- and therefore on 5 trainable
+    # stages -- unconditionally.
+    model = build_model(pretrained=starting_fresh, mask_resolution=mask_resolution)
     print(f"model: {describe_model(model)}")
     if init_from:
         print(f"initializing weights from {init_from}  "
@@ -217,7 +235,6 @@ def main(
     optimizer = torch.optim.SGD(parameters, lr=learning_rate, momentum=0.9, weight_decay=0.0005)
 
     start_epoch, history = 0, []
-    latest = find_latest_checkpoint(Path(checkpoint_dir))
     if latest:
         saved_epoch, history = load_checkpoint(latest, model, optimizer)
         start_epoch = saved_epoch + 1
