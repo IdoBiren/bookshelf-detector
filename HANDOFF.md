@@ -429,18 +429,49 @@ trails `wide` (0.860), so the aspect-ratio story is not gone, but it is no
 longer the top lever: ordinary continued training is still outperforming
 every structural change tried this session.
 
-**Not yet done, next for whoever picks this up:** the quality ceiling this
-whole phase exists to produce is not found yet — 0.6618 is a floor that was
-still climbing when last measured, five epochs is not a plateau, and the
-browser-vs-server decision cannot be taken against a number still moving.
-Next: an LR step-down (`--learning-rate 0.0005` via another cold
-`--init-from` restart from `checkpoints_ctrl14/checkpoint_epoch_004.pt`, no
-new code needed), then continued training with the existing resume path
-until two successive **eval** runs move `mAP@50` by under ~1pp. Only once
-that plateaus does `MultiScaleRoIAlign`'s `LevelMapper` `canonical_scale`
-(which moves elongated boxes to a finer FPN level, changing the feature map
-itself rather than re-sampling it) become the next structural lever worth
-trying.
+**2026-09-07 update: the LR step-down above was run to a plateau, `--augment`
+was tried and rejected, and `canonical_scale` is now implemented (not yet
+trained).** In order:
+
+1. `--learning-rate 0.0005` via cold `--init-from` restart from
+   `checkpoints_ctrl14/checkpoint_epoch_004.pt`, 5 epochs →
+   `checkpoints_lr5e4/checkpoint_epoch_004.pt`: **mAP@50 0.7102, recall@50
+   0.7616** — the LR cut alone was the single largest gain measured this
+   project (+4.84pp over the ctrl14 baseline).
+2. Continued (warm resume, same `--checkpoint-dir`) to epoch 14: **mAP@50
+   0.7183, recall@50 0.7707** — only +0.81pp over 10 more epochs, a clean
+   plateau by the stated rule. **`checkpoint_epoch_014.pt` is the best
+   checkpoint as of this writing.** `thin` quad recall barely moved (0.658
+   → 0.668) against `wide`'s 0.910, so the width gap survived the plateau
+   unchanged — training budget is exhausted as a lever, the gap is
+   structural.
+3. `--augment` (`cb9d715`, wired but never run): same 5-epoch cold-restart
+   setup as step 1, this time from epoch 14, **regressed to mAP@50
+   0.6543** (−6.4pp against the epoch-14 control). Cleanly isolated —
+   identical restart mechanics, augment the only variable — but only 5
+   epochs on a harder augmented distribution, so this is "not enough
+   epochs to see a benefit" rather than a settled verdict. **Parked, not
+   adopted**, same treatment as `mask_resolution=28` and DBNet before it.
+4. `canonical_scale` (`d0e579c`): implemented in `build_model`,
+   `train.py`, `evaluate.py`/`detect.py` (self-describing checkpoint field,
+   same pattern as `mask_resolution`). **The direction in this file's own
+   earlier draft was wrong and is corrected here**: measured directly on
+   2,294 val-set spines with torchvision's own `LevelMapper`, only ~12% land
+   on the finest feature level at the 224 default; **raising**
+   `canonical_scale` (not lowering it) pushes more spines to that finest
+   level (~448 → ~65–70%, ~640+ saturates ~98% everywhere). Also corrected:
+   it is a **uniform** push across width bands, not thin-specific — thin
+   and wide land at nearly the same level at every value tried, since box
+   area doesn't discriminate width sharply. Not yet trained.
+
+**Next for whoever picks this up:** train `canonical_scale=448` (or similar)
+from `checkpoint_epoch_014.pt` via `--init-from`, evaluate with
+`--stage-recall`, and compare against **0.7183 / 0.7707** — not the older
+ctrl14 or lr5e4-epoch-4 numbers. If it helps, the honest place to look first
+is whether it helps *uniformly* (as measured) or disproportionately helps
+`thin` in practice despite the level-assignment measurement being uniform —
+those are different outcomes and the width-tercile breakdown in
+`evaluate.py`'s own output distinguishes them.
 
 `checkpoint_epoch_009.pt` is untouched throughout — every run in this
 section writes to its own `--checkpoint-dir`, never overwriting it.
