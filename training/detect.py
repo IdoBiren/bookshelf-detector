@@ -34,7 +34,11 @@ from evaluate import deduplicate_quads
 from mask_to_quad import mask_to_quad
 from model import build_model, set_detection_thresholds
 from polygon_offset import Point
-from train import load_checkpoint, read_checkpoint_mask_resolution
+from train import (
+    load_checkpoint,
+    read_checkpoint_canonical_scale,
+    read_checkpoint_mask_resolution,
+)
 
 # 0.05 is torchvision's own box_score_thresh and the value §8א measures at,
 # but it emits 70-100 detections on a dense shelf -- unusable in a UI.
@@ -74,6 +78,7 @@ class Detector:
     device: torch.device
     score_threshold: float
     mask_resolution: int
+    canonical_scale: int
 
 
 def preprocess_image(image: Image.Image) -> torch.Tensor:
@@ -105,11 +110,15 @@ def load_detector(
 
     # The checkpoint records what it was trained with. Reading it back rather
     # than defaulting matters because mask_head/mask_predictor weight shapes
-    # do NOT depend on mask_resolution -- building at the wrong one loads
-    # cleanly and then produces masks the weights have never seen.
+    # do NOT depend on mask_resolution or canonical_scale -- building at the
+    # wrong values loads cleanly and then produces masks the weights have
+    # never seen.
     mask_resolution = read_checkpoint_mask_resolution(checkpoint)
+    canonical_scale = read_checkpoint_canonical_scale(checkpoint)
 
-    model = build_model(pretrained=False, mask_resolution=mask_resolution)
+    model = build_model(
+        pretrained=False, mask_resolution=mask_resolution, canonical_scale=canonical_scale
+    )
     load_checkpoint(checkpoint, model)
     model.to(resolved_device)
     model.eval()
@@ -119,6 +128,7 @@ def load_detector(
         device=resolved_device,
         score_threshold=score_threshold,
         mask_resolution=mask_resolution,
+        canonical_scale=canonical_scale,
     )
 
 
@@ -176,6 +186,7 @@ def main() -> None:
 
     detector = load_detector(args.checkpoint, args.score_threshold)
     print(f"device: {detector.device}  mask_resolution: {detector.mask_resolution}"
+          f"  canonical_scale: {detector.canonical_scale}"
           f"  score_threshold: {detector.score_threshold}")
 
     image = Image.open(args.image)

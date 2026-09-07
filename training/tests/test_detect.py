@@ -27,13 +27,18 @@ from model import build_model  # noqa: E402
 from train import save_checkpoint  # noqa: E402
 
 
-def _write_checkpoint(directory: Path, mask_resolution: int = 14) -> Path:
+def _write_checkpoint(
+    directory: Path, mask_resolution: int = 14, canonical_scale: int = 224
+) -> Path:
     """A real (untrained) checkpoint. Untrained is fine — these tests are
     about plumbing, not detection quality, and it keeps them offline."""
-    model = build_model(pretrained=False, mask_resolution=mask_resolution)
+    model = build_model(
+        pretrained=False, mask_resolution=mask_resolution, canonical_scale=canonical_scale
+    )
     optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.1)
     return save_checkpoint(
-        directory, model, optimizer, epoch=0, history=[], mask_resolution=mask_resolution
+        directory, model, optimizer, epoch=0, history=[],
+        mask_resolution=mask_resolution, canonical_scale=canonical_scale,
     )
 
 
@@ -115,6 +120,15 @@ class TestLoadDetector(unittest.TestCase):
             path = _write_checkpoint(Path(tmp), mask_resolution=28)
             detector = load_detector(path)
             self.assertEqual(detector.model.roi_heads.mask_roi_pool.output_size, (28, 28))
+
+    def test_honors_the_checkpoints_own_canonical_scale(self):
+        """Same reasoning as mask_resolution, same mechanism: shapes don't
+        depend on canonical_scale, so this must also be read back rather
+        than assumed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_checkpoint(Path(tmp), canonical_scale=112)
+            detector = load_detector(path)
+            self.assertEqual(detector.model.roi_heads.mask_roi_pool.canonical_scale, 112)
 
     def test_applies_the_serving_score_threshold(self):
         """0.05 (the model's own floor) emits 70-100 detections per image and

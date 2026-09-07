@@ -43,6 +43,7 @@ def build_model(
     trainable_backbone_layers: int | None = None,
     nms_thresh: float | None = 0.6,
     mask_resolution: int = 14,
+    canonical_scale: int = 224,
 ):
     """Mask R-CNN ResNet50-FPN with both predictor heads resized to
     NUM_CLASSES.
@@ -66,19 +67,49 @@ def build_model(
     e.g. to reproduce the pre-measurement baseline.
 
     `mask_resolution` overrides `roi_heads.mask_roi_pool`'s output size
-    (torchvision's default is 14, i.e. a 14x14 pooled grid). Still
-    torchvision's own default here -- this is an open question, not a
-    measured result yet. The reason to raise it: a spine's median aspect
-    ratio is 13.8:1 (p90 27.8:1), so even a perfectly boxed spine (box-stage
-    recall measured at 0.99+) has its WIDTH squeezed into ~2px of a 14x14
-    grid (~1px at the p90 ratio) before `mask_to_quad` ever sees it, and
-    quad-stage recall was measured collapsing to ~0.67 immediately
-    downstream of that. Doubling to 28 quadruples that to ~4-8px.
-    `mask_head`/`mask_predictor` are conv/deconv layers, so their weight
-    shapes depend on channel counts, not on this value (pinned by a test) --
-    a checkpoint trained at 14 is expected to load into a model built with a
-    different `mask_resolution` as a warm start, though whether those
-    weights train well at the new resolution is exactly what is untested."""
+    (torchvision's default is 14, i.e. a 14x14 pooled grid). **Measured and
+    REJECTED, kept only as a tested seam.** A spine's median aspect ratio is
+    13.8:1, so even a perfectly boxed spine (box-stage recall 0.99+) has its
+    WIDTH squeezed into ~2px of a 14x14 grid before `mask_to_quad` ever sees
+    it -- but doubling to 28x28 made every measure WORSE (-22.3pp mAP@50
+    against the correct control), because `LevelMapper` assigns a
+    detection's FPN level by BOX AREA, not width: an elongated low-area
+    spine lands on a coarse feature map regardless of how densely that same
+    coarse map is re-sampled afterward. The actual lever for this is
+    `canonical_scale` below, which changes WHICH feature map is used, not
+    how it is re-sampled. `mask_head`/`mask_predictor` are conv/deconv
+    layers, so their weight shapes depend on channel counts, not on this
+    value (pinned by a test) -- a checkpoint trained at 14 loads into a
+    model built with a different `mask_resolution` as a warm start.
+
+    `canonical_scale` overrides `roi_heads.mask_roi_pool`'s `LevelMapper`
+    (torchvision's default is 224). This is the lever `mask_resolution`
+    was mistaken for. `MultiScaleRoIAlign` picks which FPN level to pool a
+    detection from using `canonical_scale`/`canonical_level`: a box near
+    `canonical_scale` pixels on a side maps to `canonical_level`, larger
+    boxes to coarser levels, smaller to finer -- keyed on box AREA, and
+    calibrated for COCO-scale objects (~224px). A book spine's box area is
+    far smaller than that in absolute pixels, so it already lands finer
+    than `canonical_level`, but not at the finest level available: measured
+    directly on 2,294 val-set spines with torchvision's own `LevelMapper`,
+    only ~12% land on the finest level at the default 224; **RAISING**
+    `canonical_scale` -- not lowering it -- widens the gap between a
+    spine's small area and the (now larger) calibration point, pushing more
+    of them to that finest level (~448 puts ~65-70% there; ~640+ saturates
+    everywhere at ~98%, past which there is nothing left to gain). This is
+    a uniform push, not a thin-specific one: thin and wide spines land at
+    almost the same level at every canonical_scale tried (their areas
+    aren't different enough to matter to this area-keyed formula), so the
+    honest framing is "give the mask branch a finer feature map for every
+    spine" rather than "close the thin/wide gap" -- thin may still benefit
+    most since it had the least headroom, but that is a hypothesis, not
+    what this lever was measured to do. Applied only to `mask_roi_pool`,
+    deliberately not `box_roi_pool`: box-stage recall is already 0.99+
+    regardless of spine width, so it isn't broken and doesn't need this.
+    Not yet trained -- the level-assignment measurement above is confirmed;
+    whether it improves the trained model is the open question, in the
+    same "tested seam, unproven result" state `mask_resolution` was in
+    before it was measured and rejected."""
     # weights_backbone must be pinned off too. torchvision defaults it to
     # ImageNet weights independently of `weights`, so `weights=None` alone
     # still triggers a ~100MB ResNet50 download -- which quietly made the
@@ -97,14 +128,17 @@ def build_model(
         in_features_mask, DEFAULT_HIDDEN_LAYER, NUM_CLASSES
     )
 
-    if mask_resolution != 14:
+    if mask_resolution != 14 or canonical_scale != 224:
         # featmap_names / sampling_ratio copied from torchvision's own
         # maskrcnn_resnet50_fpn construction (verified interactively, not
-        # assumed) -- only output_size is the thing this function changes.
+        # assumed) -- output_size and canonical_scale are the only things
+        # this function changes, and independently of each other (a
+        # combined sweep needs both settable in one build_model call).
         model.roi_heads.mask_roi_pool = MultiScaleRoIAlign(
             featmap_names=["0", "1", "2", "3"],
             output_size=mask_resolution,
             sampling_ratio=2,
+            canonical_scale=canonical_scale,
         )
 
     if nms_thresh is not None:

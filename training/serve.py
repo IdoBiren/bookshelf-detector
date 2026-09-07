@@ -130,6 +130,7 @@ def _warm_up() -> None:
     detector = get_detector()
     print(f"checkpoint: {CHECKPOINT}")
     print(f"device: {detector.device}  mask_resolution: {detector.mask_resolution}"
+          f"  canonical_scale: {detector.canonical_scale}"
           f"  score_threshold: {detector.score_threshold}")
     # One throwaway forward pass: the first inference is markedly slower
     # than the rest (lazy CUDA/cuDNN init, allocator warm-up).
@@ -163,6 +164,7 @@ def health() -> dict:
         "checkpoint": str(CHECKPOINT),
         "score_threshold": detector.score_threshold,
         "mask_resolution": detector.mask_resolution,
+        "canonical_scale": detector.canonical_scale,
     }
 
 

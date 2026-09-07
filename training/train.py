@@ -64,6 +64,7 @@ def save_checkpoint(
     epoch: int,
     history: list[dict],
     mask_resolution: int = 14,
+    canonical_scale: int = 224,
 ) -> Path:
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -77,6 +78,7 @@ def save_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "history": history,
             "mask_resolution": mask_resolution,
+            "canonical_scale": canonical_scale,
         },
         path,
     )
@@ -93,6 +95,17 @@ def read_checkpoint_mask_resolution(path: Path) -> int:
     e.g. checkpoint_epoch_009.pt from the original pretrain run."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     return checkpoint.get("mask_resolution", 14)
+
+
+def read_checkpoint_canonical_scale(path: Path) -> int:
+    """The canonical_scale a checkpoint's mask_roi_pool was built with, for
+    the same reason and by the same mechanism as
+    read_checkpoint_mask_resolution: shapes don't depend on it, so loading
+    at the wrong value fails silently rather than raising. Defaults to 224
+    (torchvision's own default) for a checkpoint saved before this field
+    existed -- every checkpoint up to and including checkpoints_lr5e4."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    return checkpoint.get("canonical_scale", 224)
 
 
 def load_checkpoint(
@@ -175,6 +188,7 @@ def main(
     num_workers: int = 2,
     log_every: int = 20,
     mask_resolution: int = 14,
+    canonical_scale: int = 224,
     init_from: str | None = None,
     augment: bool = False,
     augment_seed: int | None = None,
@@ -223,7 +237,11 @@ def main(
     # off `starting_fresh` instead means --init-from and every later resume
     # of it agree on pretrained=False -- and therefore on 5 trainable
     # stages -- unconditionally.
-    model = build_model(pretrained=starting_fresh, mask_resolution=mask_resolution)
+    model = build_model(
+        pretrained=starting_fresh,
+        mask_resolution=mask_resolution,
+        canonical_scale=canonical_scale,
+    )
     print(f"model: {describe_model(model)}")
     if init_from:
         print(f"initializing weights from {init_from}  "
@@ -253,6 +271,7 @@ def main(
         path = save_checkpoint(
             Path(checkpoint_dir), model, optimizer, epoch, history,
             mask_resolution=mask_resolution,
+            canonical_scale=canonical_scale,
         )
         print(f"epoch {epoch}: mean_loss={mean_loss:.4f}  {elapsed:.0f}s  -> {path.name}", flush=True)
 
@@ -279,18 +298,32 @@ if __name__ == "__main__":
                              "epoch apart from a hang.")
     parser.add_argument(
         "--mask-resolution", type=int, default=14,
-        help="mask_roi_pool's output grid size (torchvision default 14). Raising it "
-             "gives a spine's width more pixels to work with before mask_to_quad -- "
-             "see model.build_model's docstring for the measurement this responds to. "
-             "Recorded in every checkpoint this run saves, so evaluate.py can read it "
-             "back instead of needing to be told correctly by hand.",
+        help="mask_roi_pool's output grid size (torchvision default 14). MEASURED "
+             "AND REJECTED at 28 (-22.3pp mAP@50 against the correct control) -- "
+             "see model.build_model's docstring for why. Kept as a tested seam, not "
+             "a recommendation. Recorded in every checkpoint this run saves, so "
+             "evaluate.py can read it back instead of needing to be told correctly "
+             "by hand.",
+    )
+    parser.add_argument(
+        "--canonical-scale", type=int, default=224,
+        help="mask_roi_pool's LevelMapper canonical_scale (torchvision default 224). "
+             "The lever --mask-resolution was mistaken for: RAISING this (not "
+             "lowering) pushes spine-sized boxes to a finer FPN level for the mask "
+             "branch, since their area is far smaller than 224's COCO-scale "
+             "calibration -- measured ~448 puts ~65-70%% of val spines on the "
+             "finest level (~12%% at the 224 default), ~640+ saturates everywhere. "
+             "A uniform push, not thin-specific -- see model.build_model's "
+             "docstring. Trained effect not yet measured. Recorded in every "
+             "checkpoint this run saves, same as --mask-resolution.",
     )
     parser.add_argument(
         "--init-from", default=None,
         help="Warm-start from another checkpoint's weights: fresh optimizer, epoch 0 "
              "-- this is NOT --checkpoint-dir resume, it starts a different run. Works "
-             "across a different --mask-resolution than that checkpoint was saved "
-             "with (mask_head/mask_predictor weight shapes don't depend on it).",
+             "across a different --mask-resolution or --canonical-scale than that "
+             "checkpoint was saved with (mask_head/mask_predictor weight shapes "
+             "don't depend on either).",
     )
     parser.add_argument(
         "--augment", action="store_true",
@@ -322,6 +355,7 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         log_every=args.log_every,
         mask_resolution=args.mask_resolution,
+        canonical_scale=args.canonical_scale,
         init_from=args.init_from,
         augment=args.augment,
         augment_seed=args.augment_seed,

@@ -25,6 +25,7 @@ from train import (  # noqa: E402
     find_latest_checkpoint,
     load_checkpoint,
     load_model_weights_only,
+    read_checkpoint_canonical_scale,
     read_checkpoint_mask_resolution,
     save_checkpoint,
 )
@@ -106,6 +107,38 @@ class TestMaskResolutionRecording(unittest.TestCase):
             optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
             path = save_checkpoint(Path(tmp), model, optimizer, epoch=0, history=[])
             self.assertEqual(read_checkpoint_mask_resolution(path), 14)
+
+
+class TestCanonicalScaleRecording(unittest.TestCase):
+    """Same self-description need as mask_resolution, same reason: a
+    checkpoint trained at one canonical_scale loads as a warm start into a
+    model built with a different one (shapes are channel-based, not
+    dependent on which FPN level was pooled from) -- so evaluating at the
+    wrong canonical_scale would also fail silently rather than raising."""
+
+    def test_recorded_scale_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = _TinyModel(1.0)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+            path = save_checkpoint(
+                Path(tmp), model, optimizer, epoch=0, history=[], canonical_scale=112
+            )
+            self.assertEqual(read_checkpoint_canonical_scale(path), 112)
+
+    def test_a_checkpoint_saved_before_this_field_existed_reads_as_224(self):
+        """Backward compatibility with every checkpoint saved before this
+        field existed, including checkpoint_epoch_009.pt and ctrl14/lr5e4."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkpoint_epoch_000.pt"
+            torch.save({"epoch": 0, "model_state_dict": {}, "history": []}, path)
+            self.assertEqual(read_checkpoint_canonical_scale(path), 224)
+
+    def test_default_save_records_224(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = _TinyModel(1.0)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+            path = save_checkpoint(Path(tmp), model, optimizer, epoch=0, history=[])
+            self.assertEqual(read_checkpoint_canonical_scale(path), 224)
 
 
 class TestLoadModelWeightsOnly(unittest.TestCase):

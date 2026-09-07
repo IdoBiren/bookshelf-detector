@@ -161,6 +161,88 @@ class TestMaskResolution(unittest.TestCase):
         self.assertEqual(model.roi_heads.mask_roi_pool.output_size, (14, 14))
 
 
+class TestCanonicalScale(unittest.TestCase):
+    """`mask_resolution` (above) was the wrong lever, measured and refuted:
+    doubling the pooling grid to 28x28 made every number worse (-22.3pp
+    mAP@50 against the correct control), because torchvision's
+    `LevelMapper` assigns each detection's FPN level by BOX AREA
+    (`canonical_scale`, default 224, calibrated for ~224px COCO-scale
+    objects) -- re-sampling a coarse feature map more densely cannot
+    manufacture detail that was never in it. `canonical_scale` changes
+    WHICH map gets used instead.
+
+    Measured directly on 2,294 val-set spines with torchvision's own
+    `LevelMapper` (not assumed): only ~12% land on the finest available
+    feature level at the 224 default; **raising** canonical_scale -- not
+    lowering it, the opposite of an early draft of this fix -- widens the
+    gap between a spine's small box area and the (now larger) calibration
+    point, pushing more spines to that finest level (~448 -> ~65-70%,
+    ~640+ saturates ~98% everywhere). This is a uniform push across width
+    bands (thin and wide land at nearly the same level, since their areas
+    aren't different enough to matter to an area-keyed formula), not a
+    thin-specific fix, so the honest claim is "finer features for every
+    spine," and whether that improves the trained model is untested.
+
+    Deliberately only `mask_roi_pool`'s LevelMapper, not `box_roi_pool`'s:
+    box-stage recall is already measured at 0.99+ regardless of spine
+    width, so it is not broken and does not need this."""
+
+    def test_raises_the_mask_pools_canonical_scale(self):
+        model = build_model(pretrained=False, canonical_scale=448)
+        self.assertEqual(model.roi_heads.mask_roi_pool.canonical_scale, 448)
+
+    def test_leaves_the_box_pools_canonical_scale_untouched(self):
+        """box-stage recall is already 0.99+ -- this must not become a
+        second, unrelated experiment riding on the same flag."""
+        model = build_model(pretrained=False, canonical_scale=448)
+        self.assertEqual(model.roi_heads.box_roi_pool.canonical_scale, 224)
+
+    def test_default_is_still_224_when_not_asked_for(self):
+        """Opt-in, like mask_resolution -- not a silent default flip."""
+        model = build_model(pretrained=False)
+        self.assertEqual(model.roi_heads.mask_roi_pool.canonical_scale, 224)
+
+    def test_mask_head_and_predictor_weight_shapes_are_unchanged(self):
+        """Same compatibility claim as mask_resolution, for the same
+        reason: canonical_scale changes WHICH feature map is sampled, not
+        the channel counts mask_head/mask_predictor operate on. A checkpoint
+        trained at the default canonical_scale is expected to load as a
+        warm start into a model built with a different one."""
+        default = build_model(pretrained=False)
+        changed = build_model(pretrained=False, canonical_scale=448)
+
+        default_head = {k: v.shape for k, v in default.roi_heads.mask_head.state_dict().items()}
+        changed_head = {k: v.shape for k, v in changed.roi_heads.mask_head.state_dict().items()}
+        self.assertEqual(default_head, changed_head)
+
+        default_pred = {k: v.shape for k, v in default.roi_heads.mask_predictor.state_dict().items()}
+        changed_pred = {k: v.shape for k, v in changed.roi_heads.mask_predictor.state_dict().items()}
+        self.assertEqual(default_pred, changed_pred)
+
+    def test_a_checkpoint_trained_at_default_scale_loads_into_a_changed_one(self):
+        """The actual compatibility claim, not just matching shapes in the
+        abstract: load_state_dict must not raise."""
+        source = build_model(pretrained=False)
+        target = build_model(pretrained=False, canonical_scale=448)
+        target.load_state_dict(source.state_dict())  # raises on any mismatch
+
+    def test_changed_scale_model_still_runs_end_to_end(self):
+        model = build_model(pretrained=False, canonical_scale=448)
+        model.eval()
+        with torch.no_grad():
+            output = model([torch.rand(3, 256, 256)])
+        for key in ("boxes", "labels", "scores", "masks"):
+            self.assertIn(key, output[0])
+
+    def test_combines_with_mask_resolution_independently(self):
+        """The two mask_roi_pool experiments (resolution, level mapping)
+        must be settable independently -- this is the seam a future
+        combined sweep would use."""
+        model = build_model(pretrained=False, mask_resolution=28, canonical_scale=448)
+        self.assertEqual(model.roi_heads.mask_roi_pool.output_size, (28, 28))
+        self.assertEqual(model.roi_heads.mask_roi_pool.canonical_scale, 448)
+
+
 class TestTrainableBackboneLayers(unittest.TestCase):
     """Pins a real bug, found by reproducing an actual Colab crash:
     `ValueError: loaded state dict contains a parameter group that doesn't
